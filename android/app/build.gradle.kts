@@ -47,7 +47,7 @@ android {
     // sources. srcDirs() replaces the list, so the defaults are kept.
     sourceSets {
         getByName("main") {
-            java.srcDirs("src/main/java", "src/main/kotlin", "../../native/tdlib_bridge")
+            java.srcDirs("src/main/java", "src/main/kotlin", "../native/tdlib_bridge")
         }
     }
 }
