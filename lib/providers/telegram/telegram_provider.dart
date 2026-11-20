@@ -25,6 +25,9 @@ import 'telegram_errors.dart';
 /// into errors, results, or diagnostics (PROJECT_RULES #16). The QR link
 /// lives inside [TelegramOtherDeviceStep] in memory only.
 final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
+  // ignore: prefer_initializing_formals — the parameters are public named
+  // arguments (callers outside this library pass `bridge:` etc.) while the
+  // fields are intentionally private, so initializing formals cannot apply.
   TelegramProvider({
     required TdlibBridge bridge,
     required TelegramCredentialsStore credentialsStore,

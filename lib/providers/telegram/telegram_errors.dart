@@ -1,4 +1,4 @@
-import 'provider_error.dart';
+import '../provider_error.dart';
 
 /// Maps a TDLib error (numeric [code] + [message]) onto the generic
 /// [ProviderError] taxonomy.
