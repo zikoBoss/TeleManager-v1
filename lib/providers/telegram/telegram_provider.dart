@@ -1,3 +1,7 @@
+// ignore_for_file: prefer_initializing_formals
+// The constructor's parameters are public named arguments used by callers
+// outside this library, while the fields are intentionally private, so
+// initializing formals cannot apply here.
 import 'dart:async';
 
 import '../account_capabilities.dart';
@@ -28,7 +32,6 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   // Public named parameters (`bridge:` etc.) are part of the API used by
   // callers outside this library, while the fields are intentionally
   // private — initializing formals cannot apply here.
-  // ignore: prefer_initializing_formals
   TelegramProvider({
     required TdlibBridge bridge,
     required TelegramCredentialsStore credentialsStore,
