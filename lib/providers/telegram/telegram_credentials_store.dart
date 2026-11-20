@@ -26,10 +26,9 @@ abstract interface class TelegramCredentialsStore {
 }
 
 /// Keystore/Keychain-backed implementation via `flutter_secure_storage`.
-final class SecureTelegramCredentialsStore
-    implements TelegramCredentialsStore {
+final class SecureTelegramCredentialsStore implements TelegramCredentialsStore {
   SecureTelegramCredentialsStore([FlutterSecureStorage? storage])
-      : _storage = storage ?? const FlutterSecureStorage();
+    : _storage = storage ?? const FlutterSecureStorage();
 
   static const _apiIdKey = 'telegram_api_id';
   static const _apiHashKey = 'telegram_api_hash';

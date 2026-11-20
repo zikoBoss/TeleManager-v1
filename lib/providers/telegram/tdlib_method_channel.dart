@@ -132,7 +132,7 @@ abstract interface class TdlibBridge {
 /// calls: `onAuthorizationState` and `onError`.
 final class MethodChannelTdlibBridge implements TdlibBridge {
   MethodChannelTdlibBridge([MethodChannel? channel])
-      : _channel = channel ?? const MethodChannel('telemanager.tdlib') {
+    : _channel = channel ?? const MethodChannel('telemanager.tdlib') {
     _channel.setMethodCallHandler(_handleMethodCall);
   }
 
@@ -193,9 +193,7 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
 
   @override
   Future<void> setAuthenticationPhoneNumber(String phoneNumber) async {
-    await _invoke('setAuthenticationPhoneNumber', {
-      'phoneNumber': phoneNumber,
-    });
+    await _invoke('setAuthenticationPhoneNumber', {'phoneNumber': phoneNumber});
   }
 
   @override
@@ -277,9 +275,7 @@ ProviderError _mapPlatformException(PlatformException e) {
     case 'bridge_timeout':
       return ProviderNetwork(e.message ?? 'Timed out waiting for TDLib.');
     case 'bridge_not_initialized':
-      return const ProviderNotInitialized(
-        'TDLib bridge is not initialized.',
-      );
+      return const ProviderNotInitialized('TDLib bridge is not initialized.');
     case 'bridge_disposed':
       return const ProviderUnknown(
         'bridge_disposed',

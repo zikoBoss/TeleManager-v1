@@ -52,9 +52,8 @@ final class FakeTdlibBridge implements TdlibBridge {
   void emitAuthUpdate(TdlibAuthUpdate update) => _authUpdates.add(update);
 
   /// Drives a Ready update into the provider.
-  void emitReady() => emitAuthUpdate(
-        const TdlibAuthUpdate(state: 'AuthorizationStateReady'),
-      );
+  void emitReady() =>
+      emitAuthUpdate(const TdlibAuthUpdate(state: 'AuthorizationStateReady'));
 
   /// Drives an unsolicited TDLib error into the provider.
   void emitError(TdlibError error) => _errors.add(error);
@@ -132,9 +131,7 @@ final class FakeTdlibBridge implements TdlibBridge {
     failNextClose = null;
     if (failure != null) throw failure;
     // Mirror reality: the native side emits Closed after Close.
-    emitAuthUpdate(
-      const TdlibAuthUpdate(state: 'AuthorizationStateClosed'),
-    );
+    emitAuthUpdate(const TdlibAuthUpdate(state: 'AuthorizationStateClosed'));
   }
 
   @override

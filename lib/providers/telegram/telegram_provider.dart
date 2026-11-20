@@ -31,10 +31,10 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
     required String databaseDirectory,
     required String filesDirectory,
     this.applicationVersion = '1.0.0',
-  })  : _bridge = bridge,
-        _credentialsStore = credentialsStore,
-        _databaseDirectory = databaseDirectory,
-        _filesDirectory = filesDirectory;
+  }) : _bridge = bridge,
+       _credentialsStore = credentialsStore,
+       _databaseDirectory = databaseDirectory,
+       _filesDirectory = filesDirectory;
 
   final TdlibBridge _bridge;
   final TelegramCredentialsStore _credentialsStore;
@@ -121,11 +121,13 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
     final apiId = await _credentialsStore.readApiId();
     final apiHash = await _credentialsStore.readApiHash();
     if (apiId == null || apiHash == null) {
-      return _emit(const AuthFailed(
-        ProviderUnauthenticated(
-          'No Telegram credentials stored. Save the api id and api hash first.',
+      return _emit(
+        const AuthFailed(
+          ProviderUnauthenticated(
+            'No Telegram credentials stored. Save the api id and api hash first.',
+          ),
         ),
-      ));
+      );
     }
     _emit(const AuthAuthenticating());
     try {
@@ -208,12 +210,11 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
     final completer = _authCompleter;
     if (completer != null && !completer.isCompleted) {
       _authCompleter = null;
-      completer.complete(const AuthFailed(
-        ProviderUnknown(
-          'provider_disposed',
-          'TelegramProvider is disposed.',
+      completer.complete(
+        const AuthFailed(
+          ProviderUnknown('provider_disposed', 'TelegramProvider is disposed.'),
         ),
-      ));
+      );
     }
     await _authStates.close();
   }
@@ -269,17 +270,19 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
       // this stale result instead of emitting an outdated Authenticated.
       if (generation != _authGeneration) return;
       if (myId == 0) {
-        _emit(const AuthFailed(
-          ProviderUnknown(
-            'my_id_zero',
-            'Authorized but no user id was returned.',
+        _emit(
+          const AuthFailed(
+            ProviderUnknown(
+              'my_id_zero',
+              'Authorized but no user id was returned.',
+            ),
           ),
-        ));
+        );
         return;
       }
-      _emit(AuthAuthenticated(
-        AccountInfo(accountId: AccountId(myId.toString())),
-      ));
+      _emit(
+        AuthAuthenticated(AccountInfo(accountId: AccountId(myId.toString()))),
+      );
     } on ProviderError catch (e) {
       if (generation != _authGeneration) return;
       _emit(AuthFailed(e));
@@ -287,12 +290,14 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
       // _onReady runs unawaited: never let an unexpected failure
       // escape as an unhandled async error.
       if (generation != _authGeneration) return;
-      _emit(const AuthFailed(
-        ProviderUnknown(
-          'my_id_failed',
-          'Failed to read the user id after authorization.',
+      _emit(
+        const AuthFailed(
+          ProviderUnknown(
+            'my_id_failed',
+            'Failed to read the user id after authorization.',
+          ),
         ),
-      ));
+      );
     }
   }
 
@@ -307,10 +312,12 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
       case 'AuthorizationStateWaitEmailAddress':
         return const AuthAwaitingInput(TelegramEmailAddressStep());
       case 'AuthorizationStateWaitEmailCode':
-        return AuthAwaitingInput(TelegramEmailCodeStep(
-          emailAddressPattern: update.emailAddressPattern ?? '',
-          length: update.emailCodeLength ?? 0,
-        ));
+        return AuthAwaitingInput(
+          TelegramEmailCodeStep(
+            emailAddressPattern: update.emailAddressPattern ?? '',
+            length: update.emailCodeLength ?? 0,
+          ),
+        );
       case 'AuthorizationStateWaitCode':
         return AuthAwaitingInput(
           TelegramCodeStep(_parseCodeInfo(update.codeInfo)),
@@ -322,9 +329,7 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
           TelegramPasswordStep(update.passwordHint ?? ''),
         );
       case 'AuthorizationStateWaitOtherDeviceConfirmation':
-        return AuthAwaitingInput(
-          TelegramOtherDeviceStep(update.qrLink ?? ''),
-        );
+        return AuthAwaitingInput(TelegramOtherDeviceStep(update.qrLink ?? ''));
       case 'AuthorizationStateWaitPremiumPurchase':
         return const AuthAwaitingInput(TelegramPremiumStep());
       case 'AuthorizationStateClosed':
@@ -333,10 +338,12 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
         // Unknown state (e.g. a newer TDLib added one): fail loudly
         // rather than hanging. The 13 states above are exhaustive for
         // TDLib 1.8.67 (verified by javap in Task 04).
-        return AuthFailed(ProviderUnknown(
-          'unknown_authorization_state',
-          'Unknown authorization state: ${update.state}',
-        ));
+        return AuthFailed(
+          ProviderUnknown(
+            'unknown_authorization_state',
+            'Unknown authorization state: ${update.state}',
+          ),
+        );
     }
   }
 

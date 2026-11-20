@@ -54,37 +54,45 @@ void main() {
       await provider.dispose();
     });
 
-    test('authenticate without credentials completes with AuthFailed', () async {
-      final bridge = FakeTdlibBridge();
-      final provider = createProvider(bridge: bridge);
-      await provider.initialize();
-      final state = await provider.authenticate();
-      expect(state, isA<AuthFailed>());
-      expect((state as AuthFailed).error, isA<ProviderUnauthenticated>());
-      expect(bridge.setTdlibParametersCalls, 0);
-      await provider.dispose();
-    });
+    test(
+      'authenticate without credentials completes with AuthFailed',
+      () async {
+        final bridge = FakeTdlibBridge();
+        final provider = createProvider(bridge: bridge);
+        await provider.initialize();
+        final state = await provider.authenticate();
+        expect(state, isA<AuthFailed>());
+        expect((state as AuthFailed).error, isA<ProviderUnauthenticated>());
+        expect(bridge.setTdlibParametersCalls, 0);
+        await provider.dispose();
+      },
+    );
 
-    test('authenticate with credentials reaches Authenticated with my_id', () async {
-      final bridge = FakeTdlibBridge();
-      final store = storedCredentials();
-      final provider = createProvider(bridge: bridge, store: store);
-      await provider.initialize();
-      bridge.onSetTdlibParameters = bridge.emitReady;
-      final state = await provider.authenticate();
-      expect(state, isA<AuthAuthenticated>());
-      final account = (state as AuthAuthenticated).account;
-      expect(account.accountId.value, '8934661485');
-      expect(bridge.setTdlibParametersCalls, 1);
-      expect(bridge.lastApiId, 12345);
-      expect(bridge.lastApiHash, 'hash');
-      await provider.dispose();
-    });
+    test(
+      'authenticate with credentials reaches Authenticated with my_id',
+      () async {
+        final bridge = FakeTdlibBridge();
+        final store = storedCredentials();
+        final provider = createProvider(bridge: bridge, store: store);
+        await provider.initialize();
+        bridge.onSetTdlibParameters = bridge.emitReady;
+        final state = await provider.authenticate();
+        expect(state, isA<AuthAuthenticated>());
+        final account = (state as AuthAuthenticated).account;
+        expect(account.accountId.value, '8934661485');
+        expect(bridge.setTdlibParametersCalls, 1);
+        expect(bridge.lastApiId, 12345);
+        expect(bridge.lastApiHash, 'hash');
+        await provider.dispose();
+      },
+    );
 
     test('authStates emits Authenticating then Authenticated', () async {
       final bridge = FakeTdlibBridge();
-      final provider =
-          createProvider(bridge: bridge, store: storedCredentials());
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
       await provider.initialize();
       final states = <AuthState>[];
       final sub = provider.authStates.listen(states.add);
@@ -100,8 +108,10 @@ void main() {
 
     test('capabilities require auth and report unknown limits', () async {
       final bridge = FakeTdlibBridge();
-      final provider =
-          createProvider(bridge: bridge, store: storedCredentials());
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
       await provider.initialize();
       await expectLater(
         provider.getAccountCapabilities(),
@@ -122,8 +132,10 @@ void main() {
     test('rejected parameters complete with AuthFailed (no throw)', () async {
       final bridge = FakeTdlibBridge()
         ..failNextSetTdlibParameters = const ProviderNetwork('x');
-      final provider =
-          createProvider(bridge: bridge, store: storedCredentials());
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
       await provider.initialize();
       final state = await provider.authenticate();
       expect(state, isA<AuthFailed>());
@@ -133,8 +145,10 @@ void main() {
 
     test('my_id 0 after Ready is AuthFailed', () async {
       final bridge = FakeTdlibBridge()..myId = 0;
-      final provider =
-          createProvider(bridge: bridge, store: storedCredentials());
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
       await provider.initialize();
       bridge.onSetTdlibParameters = bridge.emitReady;
       final state = await provider.authenticate();
@@ -147,14 +161,14 @@ void main() {
 
     test('unknown authorization state fails loudly', () async {
       final bridge = FakeTdlibBridge();
-      final provider =
-          createProvider(bridge: bridge, store: storedCredentials());
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
       await provider.initialize();
       bridge.onSetTdlibParameters = () => bridge.emitAuthUpdate(
-            const TdlibAuthUpdate(
-              state: 'AuthorizationStateWaitSomethingNew',
-            ),
-          );
+        const TdlibAuthUpdate(state: 'AuthorizationStateWaitSomethingNew'),
+      );
       final state = await provider.authenticate();
       expect(state, isA<AuthFailed>());
       final error = (state as AuthFailed).error;
@@ -168,8 +182,10 @@ void main() {
 
     test('WaitCode maps to TelegramCodeStep with code info', () async {
       final bridge = FakeTdlibBridge();
-      final provider =
-          createProvider(bridge: bridge, store: storedCredentials());
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
       await provider.initialize();
       final states = <AuthState>[];
       final sub = provider.authStates.listen(states.add);
@@ -201,23 +217,28 @@ void main() {
       await provider.dispose();
     });
 
-    test('signOut requests logout; Closed returns to unauthenticated', () async {
-      final bridge = FakeTdlibBridge();
-      final provider =
-          createProvider(bridge: bridge, store: storedCredentials());
-      await provider.initialize();
-      bridge.onSetTdlibParameters = bridge.emitReady;
-      await provider.authenticate();
-      expect(provider.currentAuthState, isA<AuthAuthenticated>());
-      await provider.signOut();
-      expect(bridge.logOutCalls, 1);
-      bridge.emitAuthUpdate(
-        const TdlibAuthUpdate(state: 'AuthorizationStateClosed'),
-      );
-      await pumpEventQueue();
-      expect(provider.currentAuthState, isA<AuthUnauthenticated>());
-      await provider.dispose();
-    });
+    test(
+      'signOut requests logout; Closed returns to unauthenticated',
+      () async {
+        final bridge = FakeTdlibBridge();
+        final provider = createProvider(
+          bridge: bridge,
+          store: storedCredentials(),
+        );
+        await provider.initialize();
+        bridge.onSetTdlibParameters = bridge.emitReady;
+        await provider.authenticate();
+        expect(provider.currentAuthState, isA<AuthAuthenticated>());
+        await provider.signOut();
+        expect(bridge.logOutCalls, 1);
+        bridge.emitAuthUpdate(
+          const TdlibAuthUpdate(state: 'AuthorizationStateClosed'),
+        );
+        await pumpEventQueue();
+        expect(provider.currentAuthState, isA<AuthUnauthenticated>());
+        await provider.dispose();
+      },
+    );
 
     test('dispose closes the native client and rejects further use', () async {
       final bridge = FakeTdlibBridge();
@@ -226,10 +247,7 @@ void main() {
       await provider.dispose();
       expect(bridge.closeCalls, 1);
       expect(bridge.disposeCalls, 1);
-      await expectLater(
-        provider.initialize(),
-        throwsA(isA<ProviderUnknown>()),
-      );
+      await expectLater(provider.initialize(), throwsA(isA<ProviderUnknown>()));
       await expectLater(
         provider.authenticate(),
         throwsA(isA<ProviderUnknown>()),

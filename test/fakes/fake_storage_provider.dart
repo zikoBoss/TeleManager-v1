@@ -40,13 +40,15 @@ final class FakeStorageProvider implements StorageProvider {
     _throwIfNotInitialized();
     if (_current is AuthAuthenticated) return _current;
     if (!hasCredentials) {
-      return _emit(const AuthFailed(
-        ProviderUnauthenticated('No credentials.'),
-      ));
+      return _emit(
+        const AuthFailed(ProviderUnauthenticated('No credentials.')),
+      );
     }
-    return _emit(const AuthAuthenticated(
-      AccountInfo(accountId: AccountId('fake-account')),
-    ));
+    return _emit(
+      const AuthAuthenticated(
+        AccountInfo(accountId: AccountId('fake-account')),
+      ),
+    );
   }
 
   @override

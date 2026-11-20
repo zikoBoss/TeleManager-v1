@@ -1,8 +1,7 @@
 import 'package:telemanager/providers/telegram/telegram_credentials_store.dart';
 
 /// In-memory [TelegramCredentialsStore] for tests.
-final class FakeTelegramCredentialsStore
-    implements TelegramCredentialsStore {
+final class FakeTelegramCredentialsStore implements TelegramCredentialsStore {
   int? apiId;
   String? apiHash;
 

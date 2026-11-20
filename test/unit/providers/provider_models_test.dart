@@ -23,9 +23,7 @@ void main() {
 
   group('AuthState', () {
     test('authenticated carries the account', () {
-      const state = AuthAuthenticated(
-        AccountInfo(accountId: AccountId('123')),
-      );
+      const state = AuthAuthenticated(AccountInfo(accountId: AccountId('123')));
       expect(state.account.accountId.value, '123');
     });
 

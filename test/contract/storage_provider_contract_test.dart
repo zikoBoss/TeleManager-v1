@@ -41,14 +41,17 @@ void runStorageProviderContractTests({
       await provider.dispose();
     });
 
-    test('authenticate without credentials completes with AuthFailed', () async {
-      final provider = create();
-      await provider.initialize();
-      final state = await provider.authenticate();
-      expect(state, isA<AuthFailed>());
-      expect((state as AuthFailed).error, isA<ProviderUnauthenticated>());
-      await provider.dispose();
-    });
+    test(
+      'authenticate without credentials completes with AuthFailed',
+      () async {
+        final provider = create();
+        await provider.initialize();
+        final state = await provider.authenticate();
+        expect(state, isA<AuthFailed>());
+        expect((state as AuthFailed).error, isA<ProviderUnauthenticated>());
+        await provider.dispose();
+      },
+    );
 
     test('capabilities before auth throw ProviderUnauthenticated', () async {
       final provider = create();
@@ -71,10 +74,7 @@ void runStorageProviderContractTests({
     test('dispose is terminal', () async {
       final provider = await createAuthenticated();
       await provider.dispose();
-      await expectLater(
-        provider.initialize(),
-        throwsA(isA<ProviderUnknown>()),
-      );
+      await expectLater(provider.initialize(), throwsA(isA<ProviderUnknown>()));
       await expectLater(
         provider.authenticate(),
         throwsA(isA<ProviderUnknown>()),

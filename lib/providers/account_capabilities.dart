@@ -8,8 +8,7 @@ final class AccountId {
   final String value;
 
   @override
-  bool operator ==(Object other) =>
-      other is AccountId && other.value == value;
+  bool operator ==(Object other) => other is AccountId && other.value == value;
 
   @override
   int get hashCode => value.hashCode;

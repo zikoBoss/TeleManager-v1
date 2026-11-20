@@ -13,12 +13,15 @@ void main() {
       );
     });
 
-    test('FLOOD_WAIT without a number falls through (no invented duration)', () {
-      // Code 400 + unparsable FLOOD_WAIT_ -> no flood-wait branch, no
-      // other branch matches -> unknown (the 429 fallback needs a 429).
-      final error = mapTdlibError(400, 'FLOOD_WAIT_');
-      expect(error, isA<ProviderUnknown>());
-    });
+    test(
+      'FLOOD_WAIT without a number falls through (no invented duration)',
+      () {
+        // Code 400 + unparsable FLOOD_WAIT_ -> no flood-wait branch, no
+        // other branch matches -> unknown (the 429 fallback needs a 429).
+        final error = mapTdlibError(400, 'FLOOD_WAIT_');
+        expect(error, isA<ProviderUnknown>());
+      },
+    );
 
     test('401 maps to unauthenticated', () {
       expect(
@@ -47,8 +50,7 @@ void main() {
     });
 
     test('resend refusal maps to invalid input', () {
-      final error =
-          mapTdlibError(400, "Authentication code can't be resend");
+      final error = mapTdlibError(400, "Authentication code can't be resend");
       expect(error, isA<ProviderInvalidInput>());
     });
 
@@ -57,10 +59,7 @@ void main() {
     });
 
     test('403 maps to permission denied', () {
-      expect(
-        mapTdlibError(403, 'Forbidden'),
-        isA<ProviderPermissionDenied>(),
-      );
+      expect(mapTdlibError(403, 'Forbidden'), isA<ProviderPermissionDenied>());
     });
 
     test('bare 429 maps to flood wait with the documented fallback', () {
@@ -87,10 +86,7 @@ void main() {
 
     test('error codes are distinct and stable', () {
       expect(const ProviderUnauthenticated().code, 'unauthenticated');
-      expect(
-        const ProviderFloodWait(Duration(seconds: 1)).code,
-        'flood_wait',
-      );
+      expect(const ProviderFloodWait(Duration(seconds: 1)).code, 'flood_wait');
       expect(const ProviderNotInitialized().code, 'not_initialized');
       expect(const ProviderCancelled().code, 'cancelled');
     });
