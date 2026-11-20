@@ -2,7 +2,9 @@ name: Android CI
 
 on:
   push:
-    branches: [main, task02-github-ci]
+      # Task 05: run CI on the task branch too (the workflow file is not
+      # on main yet, so the Actions tab cannot dispatch it manually).
+      branches: [main, task02-github-ci, task05-storage-provider]
   pull_request:
     branches: [main]
   workflow_dispatch:
