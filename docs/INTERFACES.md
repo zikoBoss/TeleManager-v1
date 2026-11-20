@@ -1,7 +1,7 @@
 # TeleManager — العقود البرمجية العامة
 
 ## الحالة الحالية
-نسخة تأسيسية (Draft). لا توجد حتى الآن واجهات برمجية عامة منفذة في المصدر ولا ملفات Dart تشغيلية؛ لذلك لا يصف هذا الملف تواقيع على أنها موجودة. البنود أدناه حدود معمارية مطلوبة من `MASTER_BLUEPRINT.md` وستتحول إلى عقود دقيقة عند كتابة كل وحدة واختبارها.
+نسخة تأسيسية (Draft) مع أول عقدين في المهمة 05: `StorageProvider` و`StorageOperations` (التعريف) و`TelegramProvider` (دورة الحياة والمصادقة والقدرات). العقود المنفذة موثقة بالتواقيع الفعلية أدناه ومطابقة للكود والاختبارات. باقي البنود حدود معمارية مطلوبة من `MASTER_BLUEPRINT.md` وستتحول إلى عقود دقيقة عند كتابة كل وحدة واختبارها.
 
 ## قواعد تحديث هذا الملف
 1. حدّث الوثيقة مع أي إنشاء/تعديل/حذف لعقد يعبر حدود وحدتين.
@@ -9,10 +9,65 @@
 3. طابق النص مع الكود والاختبارات؛ لا تخترع دوالًا أو معاملات.
 4. عند تعديل عقد قائم، اذكر المستهلكين وأثر التغيير وخطة التوافق/الترحيل.
 
-## العقود المخططة (لم تُنفذ بعد)
+## العقود
 
-### `StorageProvider` — يملكه TM-Cloud
-المسؤولية: واجهة مستقلة عن المزود للتهيئة والمصادقة وقدرات الحساب ورفع/تنزيل الملفات وحذفها واسترجاع معلوماتها وإلغاء العمليات. نموذج المخطط في `MASTER_BLUEPRINT.md` مفاهيمي فقط وليس توقيعًا نهائيًا. المستهلكون المتوقعون: TM-Transfer وطبقة التطبيق.
+### `StorageProvider` — يملكه TM-Cloud (منفذ في المهمة 05)
+الملف: `lib/providers/storage_provider.dart`. التنفيذ الأول: `TelegramProvider` في `lib/providers/telegram/telegram_provider.dart` (عبر جسر MethodChannel إلى Kotlin في `android/native/tdlib_bridge/TdlibBridge.kt`).
+
+المسؤولية: واجهة مستقلة عن المزود للتهيئة والمصادقة وقدرات الحساب. لا تعرف TM-Core أي نوع خاص بـTelegram أو TDLib.
+
+التواقيع (Dart):
+```dart
+abstract interface class StorageProvider {
+  Future<void> initialize();
+  Stream<AuthState> get authStates;
+  AuthState get currentAuthState;
+  Future<AuthState> authenticate();
+  Future<void> signOut();
+  Future<AccountCapabilities> getAccountCapabilities();
+  Future<void> dispose();
+}
+```
+
+نماذج البيانات:
+- `AuthState` (sealed): `AuthUnauthenticated`، `AuthAuthenticating`، `AuthAwaitingInput(AuthStep)`، `AuthAuthenticated(AccountInfo)`، `AuthFailed(ProviderError)`.
+- `AuthStep`: واجهة خطوة تفاعلية (`kind`)؛ الأنواع الخاصة بـTelegram في `lib/providers/telegram/telegram_auth_steps.dart` (هاتف، رمز مع `TelegramCodeInfo`، كلمة مرور مع hint، جهاز آخر مع رابط QR في الذاكرة فقط، بريد، تسجيل، Premium).
+- `AccountInfo`: `accountId` (معتم) و`displayName?`.
+- `AccountCapabilities`: `accountId`، `maxFileSizeBytes?` (null = غير معروف/الخادم يحسم)، `supportsResumableUpload/Download`، `supportsStreaming` (false حتى يُثبت)، `maxConcurrentTransfers?`.
+- `ProviderError` (sealed في `lib/providers/provider_error.dart`): `notInitialized`، `unauthenticated`، `network`، `quotaExceeded`، `notFound`، `permissionDenied`، `floodWait(Duration retryAfter)`، `cancelled`، `invalidInput`، `unknown(providerCode, message)`. لا أسرار في الرسائل أبدًا.
+
+دورة الحياة والتزامن والإلغاء والموارد:
+- `initialize()` idempotent (لا عميل ثانٍ)؛ أي استدعاء قبلها يرمي `ProviderNotInitialized` (عدا `authStates` و`currentAuthState` و`dispose`).
+- `authenticate()` يبدأ التدفق أو يستعيد الجلسة ويُكمل بالحالة النهائية (`AuthAuthenticated` أو `AuthFailed`)؛ الحالات الوسيطة على `authStates`. بلا بيانات اعتماد محفوظة يُكمل `AuthFailed(unauthenticated)` دون رمي. `initialize` و`authenticate` محميتان من التكرار المتزامن (نفس الـFuture للمتزامنين).
+- `signOut()` خروج آمن يمسح الجلسة؛ الحالة النهائية غير المصادقة تصل عبر `authStates`.
+- `getAccountCapabilities()` يتطلب مصادقة.
+- `dispose()` نهائي وidempotent وآمن في أي وقت؛ يغلق عميل TDLib بعد تأكيد `Closed`؛ بعده لا يُستخدم المزود.
+- لا إلغاء في هذا العقد (الإلغاء في `StorageOperations`).
+
+المستهلكون: TM-Transfer وطبقة التطبيق (وميزة المصادقة لخطوات Telegram).
+
+### `StorageOperations` — يملكه TM-Cloud (معرّف في المهمة 05، يُنفَّذ في المهمة 06)
+الملف: `lib/providers/storage_operations.dart`.
+
+المسؤولية: عمليات النقل والتخزين (رفع/تنزيل/حذف/معلومات/إلغاء). فُصل عن `StorageProvider` حتى لا تشحن المهمة 05 دوالًا غير منفذة أو نتائج وهمية؛ `TelegramProvider` يضيف هذا العقد في المهمة 06.
+
+التواقيع (Dart):
+```dart
+abstract interface class StorageOperations {
+  Future<UploadResult> uploadFile(UploadRequest request, ProgressCallback onProgress);
+  Future<DownloadResult> downloadFile(DownloadRequest request, ProgressCallback onProgress);
+  Future<void> deleteFile(StorageObjectId id);
+  Future<RemoteFileInfo> getFileInfo(StorageObjectId id);
+  Future<void> cancelOperation(OperationId id);
+}
+```
+
+نماذج البيانات (في `lib/providers/transfer_models.dart` و`lib/providers/storage_object.dart`):
+- `FileId` (UUID داخلي من TM-Core، وليس أي مرجع Telegram أبدًا) و`StorageObjectId` (معتم يصنعه المزود) و`StorageObject` (حسب المخطط §6.4: `id` و`fileId` و`provider` و`accountId` و`remoteUniqueId?` و`remoteStatus`؛ مراجع Telegram الخاصة `chat_id`/`message_id`/`tdlib_file_id` في `TelegramStorageReferences` داخل حزمة المزود فقط).
+- `OperationId` (UUID لكل عملية)، و`TransferProgress` (`transferredBytes` و`totalBytes?`)، و`ProgressCallback`.
+- `UploadRequest` (`fileId` و`localPath` و`fileName` و`fileSizeBytes` و`checksumSha256?` المحسوبة من المتصل) و`DownloadRequest` و`UploadResult` (يحمل `StorageObject` الذي يجب حفظه قبل إعلان الاكتمال) و`DownloadResult` (`checksumVerified`) و`RemoteFileInfo`.
+
+القواعد: لا تُعلن عملية `Completed` قبل تأكيد المزود وحفظ المرجع؛ الإلغاء best-effort؛ الحذف السحابي ليس أثرًا جانبيًا لمسح Cache.
 
 ### عقود TM-Core
 المسؤولية: عمليات VFS مثل إنشاء المجلدات وإعادة التسمية والنقل والحذف المنطقي والبحث والتصنيف. يجب أن تكون مستقلة عن Telegram وتستخدم UUID داخليًا. لم تحدد التواقيع بعد.

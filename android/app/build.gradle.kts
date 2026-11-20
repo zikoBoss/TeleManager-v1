@@ -26,6 +26,12 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // Task 03 decision: 64-bit ABIs only (arm64-v8a + x86_64).
+        // The 32-bit libtdjni.so fails the 16KB page-size check.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
     buildTypes {
@@ -33,6 +39,15 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    // Task 05: compile the native TDLib bridge from its Blueprint
+    // location (android/native/tdlib_bridge/) alongside the app module
+    // sources. srcDirs() replaces the list, so the defaults are kept.
+    sourceSets {
+        getByName("main") {
+            java.srcDirs("src/main/java", "src/main/kotlin", "../../native/tdlib_bridge")
         }
     }
 }
@@ -45,4 +60,10 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    // Task 03 evaluated artifact: TDLib 1.8.67 (core:0.1.1).
+    // Do not change without a new evaluation (PROJECT_RULES #21).
+    implementation("io.github.tdlib-android:core:0.1.1")
 }
