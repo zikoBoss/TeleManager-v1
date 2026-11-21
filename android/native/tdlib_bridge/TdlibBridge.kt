@@ -243,12 +243,18 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     private fun getOptionVersion(result: MethodChannel.Result) {
         try {
-            when (val v = Client.execute(TdApi.GetOption("version"))) {
-                is TdApi.OptionValueString -> result.success(mapOf("value" to v.value))
-                is TdApi.Error -> result.error(v.code.toString(), v.message, null)
+            // execute() is generic: its return type is inferred as
+            // OptionValue from GetOption, and Error is disjoint from
+            // OptionValue, so an `is Error` check on the inferred type is
+            // always false (Kotlin 2.4 rejects it). Widen to Object first
+            // so both checks are ordinary downcasts.
+            val raw: TdApi.Object? = Client.execute(TdApi.GetOption("version"))
+            when (raw) {
+                is TdApi.OptionValueString -> result.success(mapOf("value" to raw.value))
+                is TdApi.Error -> result.error(raw.code.toString(), raw.message, null)
                 else -> result.error(
                     "bridge_unexpected",
-                    "Unexpected option value: ${v?.javaClass?.simpleName ?: "null"}",
+                    "Unexpected option value: ${raw?.javaClass?.simpleName ?: "null"}",
                     null,
                 )
             }
@@ -413,10 +419,8 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
             )
             is TdApi.AuthorizationStateWaitEmailCode -> mapOf(
                 "state" to name,
-                "emailAddressPattern" to
-                    state.emailAddressAuthenticationCodeInfo.emailAddressPattern,
-                "emailCodeLength" to
-                    state.emailAddressAuthenticationCodeInfo.length,
+                "emailAddressPattern" to state.codeInfo?.emailAddressPattern,
+                "emailCodeLength" to state.codeInfo?.length,
             )
             else -> mapOf("state" to name)
         }
@@ -438,20 +442,21 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     /**
-     * Every code type carries a `length` field on its concrete class
-     * (the base class does not declare one), so it is read per subclass.
+     * Digit length of the code, when the type carries one; null otherwise.
+     * FlashCall carries a pattern (never read — it is verifier data) and
+     * SmsWord/SmsPhrase carry word data, so they have no length. Mirrors
+     * the spike's CodeInfoReport.codeTypeLength.
      */
-    private fun codeTypeLength(type: TdApi.AuthenticationCodeType): Int {
+    private fun codeTypeLength(type: TdApi.AuthenticationCodeType): Int? {
         return when (type) {
             is TdApi.AuthenticationCodeTypeTelegramMessage -> type.length
             is TdApi.AuthenticationCodeTypeSms -> type.length
             is TdApi.AuthenticationCodeTypeCall -> type.length
-            is TdApi.AuthenticationCodeTypeFlashCall -> type.length
             is TdApi.AuthenticationCodeTypeMissedCall -> type.length
-            is TdApi.AuthenticationCodeTypeFragment -> type.length
             is TdApi.AuthenticationCodeTypeFirebaseAndroid -> type.length
             is TdApi.AuthenticationCodeTypeFirebaseIos -> type.length
-            else -> 0
+            is TdApi.AuthenticationCodeTypeFragment -> type.length
+            else -> null
         }
     }
 
