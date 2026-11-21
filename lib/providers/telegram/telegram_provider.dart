@@ -68,6 +68,15 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   var _initialized = false;
   var _disposed = false;
   var _authGeneration = 0;
+
+  /// Generation of the current [authenticate] attempt. Independent of
+  /// [_authGeneration] (which counts incoming authorization-state
+  /// updates, used only to drop stale [_onReady] results).
+  /// Incremented by [_invalidateAuthenticate] whenever the current
+  /// attempt is cancelled (by [signOut] or [dispose]); [_authenticate]
+  /// captures the value at its start and checks it after every await,
+  /// so a late reply can never resume a cancelled attempt.
+  var _authenticateGeneration = 0;
   Future<void>? _initializeFuture;
   Future<AuthState>? _authenticateFuture;
   Completer<AuthState>? _authCompleter;
@@ -147,8 +156,26 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   }
 
   Future<AuthState> _authenticate() async {
-    final apiId = await _credentialsStore.readApiId();
-    final apiHash = await _credentialsStore.readApiHash();
+    // Capture the attempt's generation first: every resumption after
+    // an await (success or exception) checks it, so a late reply can
+    // never resume an attempt that signOut()/dispose() cancelled.
+    final generation = _authenticateGeneration;
+    int? apiId;
+    String? apiHash;
+    try {
+      apiId = await _credentialsStore.readApiId();
+      apiHash = await _credentialsStore.readApiHash();
+    } catch (_) {
+      // A storage failure after invalidation must not replace the
+      // cancellation result with a raw exception.
+      if (generation != _authenticateGeneration) {
+        return _cancelledAuthenticateResult();
+      }
+      rethrow;
+    }
+    if (generation != _authenticateGeneration) {
+      return _cancelledAuthenticateResult();
+    }
     if (apiId == null || apiHash == null) {
       return _emit(
         const AuthFailed(
@@ -169,12 +196,31 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
         applicationVersion: applicationVersion,
       );
     } on ProviderError catch (e) {
+      // A late Error (including the technical timeout) must not
+      // replace the cancellation result or emit a stale AuthFailed:
+      // check the generation before emitting anything.
+      if (generation != _authenticateGeneration) {
+        return _cancelledAuthenticateResult();
+      }
       return _emit(AuthFailed(e));
+    } catch (_) {
+      if (generation != _authenticateGeneration) {
+        return _cancelledAuthenticateResult();
+      }
+      rethrow;
     }
-    return _waitForTerminalAuthState();
+    // _waitForTerminalAuthState checks the generation first, so a
+    // stale attempt never creates a waiter for the new client.
+    return _waitForTerminalAuthState(generation);
   }
 
-  Future<AuthState> _waitForTerminalAuthState() {
+  Future<AuthState> _waitForTerminalAuthState(int generation) {
+    // Check the generation FIRST, before the terminal-state check:
+    // a stale attempt must never create a waiter for the new client
+    // nor return a terminal state produced by the old client.
+    if (generation != _authenticateGeneration) {
+      return Future.value(_cancelledAuthenticateResult());
+    }
     final current = _currentAuthState;
     if (current is AuthAuthenticated || current is AuthFailed) {
       return Future.value(current);
@@ -184,6 +230,42 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
     final completer = Completer<AuthState>();
     _authCompleter = completer;
     return completer.future;
+  }
+
+  /// The result of an authenticate attempt that was cancelled by
+  /// [signOut] (or [dispose], which keeps its own code). Returned
+  /// (never emitted) so the stream keeps the provider's true state
+  /// ([AuthUnauthenticated] after signOut) while the caller still
+  /// gets a diagnosable reason. Follows the [dispose] precedent,
+  /// which returns `provider_disposed` the same way.
+  AuthState _cancelledAuthenticateResult() {
+    if (_disposed) {
+      return const AuthFailed(
+        ProviderUnknown('provider_disposed', 'TelegramProvider is disposed.'),
+      );
+    }
+    return const AuthFailed(
+      ProviderUnknown(
+        'authentication_cancelled_by_sign_out',
+        'Authentication was cancelled by sign out.',
+      ),
+    );
+  }
+
+  /// Invalidates the current authenticate attempt (if any): a later
+  /// resumption of the attempt observes the changed generation and
+  /// returns the cancellation result instead of continuing. Also
+  /// completes a pending [_authCompleter] with the cancellation
+  /// result (then clears it), so a caller waiting on it is freed
+  /// promptly. Called from [_signOut] once the sign-out operation
+  /// has started, and from [dispose].
+  void _invalidateAuthenticate() {
+    _authenticateGeneration++;
+    final completer = _authCompleter;
+    if (completer != null && !completer.isCompleted) {
+      _authCompleter = null;
+      completer.complete(_cancelledAuthenticateResult());
+    }
   }
 
   /// Signs out and re-creates the client. Concurrent callers share the
@@ -236,6 +318,14 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
 
   Future<void> _signOut() async {
     _throwIfPendingRequest(TdlibBridge.logOutMethod);
+    // Cancel any in-flight authenticate() attempt BEFORE the native
+    // logOut starts: the attempt belongs to the client that is about
+    // to be closed, so a late reply from it must never resume the
+    // attempt (success or error) or create a waiter for the new
+    // client. Placed after the pending-request check so a refused
+    // signOut does not cancel the attempt, and before logOut so the
+    // invalidation also holds if logOut itself times out.
+    _invalidateAuthenticate();
     try {
       await _bridge.logOut();
     } on ProviderRequestUnresolved {
@@ -335,6 +425,13 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
+    // Invalidate any in-flight authenticate() attempt first (before
+    // the first await below): a late reply resuming after dispose()
+    // started must observe the changed generation and return
+    // `provider_disposed` instead of continuing. This also completes
+    // a pending _authCompleter with that result, so a waiting caller
+    // is freed promptly.
+    _invalidateAuthenticate();
     // Unblock a signOut() that is waiting for Closed: the provider
     // is going away, so the wait must not hang until its timeout.
     final closedCompleter = _closedCompleter;
@@ -362,15 +459,6 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
       await _bridge.dispose();
     } catch (_) {
       // Best-effort.
-    }
-    final completer = _authCompleter;
-    if (completer != null && !completer.isCompleted) {
-      _authCompleter = null;
-      completer.complete(
-        const AuthFailed(
-          ProviderUnknown('provider_disposed', 'TelegramProvider is disposed.'),
-        ),
-      );
     }
     await _authStates.close();
   }
