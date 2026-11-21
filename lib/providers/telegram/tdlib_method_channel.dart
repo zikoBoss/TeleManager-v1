@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 
@@ -90,6 +91,8 @@ abstract interface class TdlibBridge {
   static const String logOutMethod = 'logOut';
   static const String closeMethod = 'close';
   static const String disposeMethod = 'dispose';
+  static const String getNoBackupFilesDirectoryMethod =
+      'getNoBackupFilesDirectory';
 
   /// Authorization-state notifications from the native client.
   Stream<TdlibAuthUpdate> get authUpdates;
@@ -120,14 +123,23 @@ abstract interface class TdlibBridge {
 
   /// Sends `SetTdlibParameters` (api id/hash, directories, version).
   /// Times out after 10s ([ProviderRequestUnresolved]) if TDLib does
-  /// not answer.
+  /// not answer. [databaseEncryptionKey] is the 32-byte key that
+  /// encrypts the TDLib database; it is bytes end-to-end and is never
+  /// logged. The same key must be supplied on every launch.
   Future<void> setTdlibParameters({
     required int apiId,
     required String apiHash,
     required String databaseDirectory,
     required String filesDirectory,
     required String applicationVersion,
+    required Uint8List databaseEncryptionKey,
   });
+
+  /// Returns the Android no-backup files directory
+  /// (`Context.getNoBackupFilesDir()`), which the OS excludes from
+  /// Auto Backup. The TDLib database lives under it so a backup can
+  /// never restore a database without its (Keystore-bound) key.
+  Future<String> getNoBackupFilesDirectory();
 
   /// Sends `SetAuthenticationPhoneNumber`.
   Future<void> setAuthenticationPhoneNumber(String phoneNumber);
@@ -257,6 +269,7 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
     required String databaseDirectory,
     required String filesDirectory,
     required String applicationVersion,
+    required Uint8List databaseEncryptionKey,
   }) async {
     await _invoke(TdlibBridge.setTdlibParametersMethod, {
       'apiId': apiId,
@@ -264,7 +277,45 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
       'databaseDirectory': databaseDirectory,
       'filesDirectory': filesDirectory,
       'applicationVersion': applicationVersion,
+      // Sent as binary (Uint8List), never as a string, and never logged.
+      'databaseEncryptionKey': databaseEncryptionKey,
     }, timeout: const Duration(seconds: 10));
+  }
+
+  @override
+  Future<String> getNoBackupFilesDirectory() async {
+    final result = await _invoke(
+      TdlibBridge.getNoBackupFilesDirectoryMethod,
+      {},
+    );
+    return (result as Map)['path'] as String;
+  }
+
+  /// Test-only (debug builds only): arms a reply delay for a TDLib
+  /// method. The request is still sent immediately; only the delivery
+  /// of its result to Dart is delayed by [delayMs]. In a release build
+  /// the native side reports `notImplemented`. The Harness (kDebugMode)
+  /// is the only caller. Not part of [TdlibBridge] (test-only surface).
+  Future<void> setTestReplyDelay(String method, int delayMs) async {
+    await _invoke('setTestReplyDelay', {'method': method, 'delayMs': delayMs});
+  }
+
+  /// Test-only (debug builds only): clears all armed reply delays.
+  /// Not part of [TdlibBridge] (test-only surface).
+  Future<void> clearTestReplyDelays() async {
+    await _invoke('clearTestReplyDelays', {});
+  }
+
+  /// Test-only (debug builds only): how many times each delayable
+  /// TDLib method was sent to the native client. Used by D1 to prove
+  /// no second `setTdlibParameters` was sent. Not part of [TdlibBridge]
+  /// (test-only surface).
+  Future<Map<String, int>> getTestSendCounts() async {
+    final result = await _invoke('getTestSendCounts', {});
+    final map = result as Map;
+    return map.map(
+      (key, value) => MapEntry(key as String, (value as num).toInt()),
+    );
   }
 
   @override

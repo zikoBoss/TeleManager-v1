@@ -39,6 +39,11 @@ dependencies:
   # Secure storage for Telegram API credentials (Task 05).
   flutter_secure_storage: ^11.2.0
 
+  # QR rendering for the temporary Test Harness (Task 05, D2/D4/D5):
+  # the QR login code is scanned by Telegram on a second device.
+  # Removed with the Harness.
+  qr_flutter: ^4.1.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

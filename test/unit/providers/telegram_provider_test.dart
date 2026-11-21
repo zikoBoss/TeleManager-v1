@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:telemanager/providers/auth_state.dart';
 import 'package:telemanager/providers/capability_status.dart';
@@ -7,16 +9,19 @@ import 'package:telemanager/providers/telegram/telegram_auth_steps.dart';
 import 'package:telemanager/providers/telegram/telegram_provider.dart';
 
 import '../../fakes/fake_credentials_store.dart';
+import '../../fakes/fake_database_key_store.dart';
 import '../../fakes/fake_tdlib_bridge.dart';
 
 TelegramProvider createProvider({
   FakeTdlibBridge? bridge,
   FakeTelegramCredentialsStore? store,
+  FakeTdlibDatabaseKeyStore? keyStore,
   Duration closeWaitTimeout = const Duration(seconds: 8),
 }) {
   return TelegramProvider(
     bridge: bridge ?? FakeTdlibBridge(),
     credentialsStore: store ?? FakeTelegramCredentialsStore(),
+    databaseKeyStore: keyStore ?? FakeTdlibDatabaseKeyStore(),
     databaseDirectory: 'db',
     filesDirectory: 'db/files',
     closeWaitTimeout: closeWaitTimeout,
@@ -1131,5 +1136,95 @@ void main() {
       expect(bridge.setTdlibParametersCalls, 2);
       await provider.dispose();
     });
+  });
+
+  group('TelegramProvider database key', () {
+    test(
+      'authenticate passes the key store key to setTdlibParameters',
+      () async {
+        final bridge = FakeTdlibBridge();
+        final keyStore = FakeTdlibDatabaseKeyStore();
+        final provider = createProvider(
+          bridge: bridge,
+          store: storedCredentials(),
+          keyStore: keyStore,
+        );
+        await provider.initialize();
+        bridge.onSetTdlibParameters = bridge.emitReady;
+        final state = await provider.authenticate();
+        expect(state, isA<AuthAuthenticated>());
+        expect(bridge.setTdlibParametersCalls, 1);
+        // The exact key from the key store reached the bridge (32 bytes).
+        expect(bridge.lastDatabaseEncryptionKey, isNotNull);
+        expect(bridge.lastDatabaseEncryptionKey!.length, 32);
+        expect(bridge.lastDatabaseEncryptionKey, keyStore.testKey);
+        // The database directory 'db' does not exist, so the key store
+        // was told there is no database (first creation).
+        expect(keyStore.getOrCreateDatabaseExistsArgs, [false]);
+        await provider.dispose();
+      },
+    );
+
+    test('a corrupt stored key fails authenticate with AuthFailed', () async {
+      final bridge = FakeTdlibBridge();
+      final keyStore = FakeTdlibDatabaseKeyStore()
+        ..failNextRead = const ProviderUnknown(
+          'tdlib_database_key_corrupt',
+          'Stored TDLib database key is corrupt.',
+        );
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+        keyStore: keyStore,
+      );
+      await provider.initialize();
+      final state = await provider.authenticate();
+      expect(state, isA<AuthFailed>());
+      final error = (state as AuthFailed).error;
+      expect(error, isA<ProviderUnknown>());
+      expect(
+        (error as ProviderUnknown).providerCode,
+        'tdlib_database_key_corrupt',
+      );
+      expect(bridge.setTdlibParametersCalls, 0);
+      await provider.dispose();
+    });
+
+    test(
+      'existing database + missing key: authenticate fails, no parameters',
+      () async {
+        // A non-empty database directory (existing database) with no
+        // stored key.
+        final dbDir = await Directory.systemTemp.createTemp('telemanager-db-');
+        try {
+          await File('${dbDir.path}/tdlib.db').writeAsString('x');
+          final bridge = FakeTdlibBridge();
+          final keyStore = FakeTdlibDatabaseKeyStore(); // storedKey is null.
+          final provider = TelegramProvider(
+            bridge: bridge,
+            credentialsStore: storedCredentials(),
+            databaseKeyStore: keyStore,
+            databaseDirectory: dbDir.path,
+            filesDirectory: '${dbDir.path}/files',
+          );
+          await provider.initialize();
+          final state = await provider.authenticate();
+          expect(state, isA<AuthFailed>());
+          final error = (state as AuthFailed).error;
+          expect(error, isA<ProviderUnknown>());
+          expect(
+            (error as ProviderUnknown).providerCode,
+            'tdlib_database_key_missing',
+          );
+          // setTdlibParameters was never sent (the key check comes first).
+          expect(bridge.setTdlibParametersCalls, 0);
+          // The key store was told a database exists.
+          expect(keyStore.getOrCreateDatabaseExistsArgs, [true]);
+          await provider.dispose();
+        } finally {
+          await dbDir.delete(recursive: true);
+        }
+      },
+    );
   });
 }

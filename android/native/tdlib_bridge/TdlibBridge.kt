@@ -1,5 +1,6 @@
 package com.example.telemanager
 
+import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -12,6 +13,7 @@ import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Native TDLib bridge for TeleManager (Task 05).
@@ -40,6 +42,7 @@ import java.util.concurrent.TimeUnit
  */
 class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
     private var channel: MethodChannel? = null
+    private var appContext: Context? = null
     private var client: Client? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
@@ -59,14 +62,96 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
     // client and is dropped before it can reach Dart.
     private var clientGeneration = 0
 
+    // ---------- test-only reply delay (BuildConfig.DEBUG only) ----------
+    //
+    // D1/D3 need a deterministic technical timeout. The request is
+    // still sent to TDLib immediately; only the delivery of its
+    // MethodChannel.Result to Dart is delayed. Authorization-state
+    // updates travel on a separate channel (onAuthorizationState) and
+    // are never delayed.
+    //
+    // All of this state is inert in release builds: the delay map is
+    // only written when BuildConfig.DEBUG is true, the counter is only
+    // incremented then, and the delay methods report notImplemented.
+    // It is removed with the Harness.
+
+    // Method key -> reply delay in ms (armed by setTestReplyDelay).
+    private val testReplyDelays = mutableMapOf<String, Long>()
+
+    // Method key -> how many times it was sent (see getTestSendCounts).
+    private val testSendCounts = mutableMapOf<String, Int>()
+
+    // Replies whose delivery to Dart is pending (immediate or delayed).
+    // Accessed from the TDLib thread (add) and the main thread
+    // (deliver / cancel), so guarded by its own monitor.
+    private val pendingReplies = mutableSetOf<PendingReply>()
+
+    // Set in onDetachedFromEngine. Volatile so the TDLib thread and
+    // the main thread agree. A delivery that sees it drops the result
+    // instead of calling it after the channel expired.
+    @Volatile
+    private var detached = false
+
+    // A TDLib result whose delivery to Dart is pending. The Result is
+    // delivered exactly once (AtomicBoolean), on the main thread, and
+    // never after detach. The runnable is stored so
+    // onDetachedFromEngine can cancel a delayed delivery.
+    private inner class PendingReply(
+        private val result: MethodChannel.Result,
+        private val deliverAction: () -> Unit,
+    ) {
+        val delivered = AtomicBoolean(false)
+        var runnable: Runnable? = null
+
+        fun deliver() {
+            if (detached) {
+                removeSelf()
+                return
+            }
+            if (!delivered.compareAndSet(false, true)) {
+                removeSelf()
+                return
+            }
+            try {
+                deliverAction()
+            } catch (_: Throwable) {
+                // Calling a Result after detach must never crash.
+            } finally {
+                removeSelf()
+            }
+        }
+
+        private fun removeSelf() {
+            synchronized(pendingReplies) { pendingReplies.remove(this) }
+        }
+    }
+
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel = MethodChannel(binding.binaryMessenger, "telemanager.tdlib")
         channel?.setMethodCallHandler(this)
+        appContext = binding.applicationContext
+        detached = false
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        // Precise order (main thread; the main looper serializes this
+        // with any delivery, so the two cannot interleave):
+        // 1. Cancel every pending delayed delivery, so no Result is
+        //    delivered after detach.
+        // 2. Mark detached, so a delivery that already started drops.
+        // 3. Close the client (terminates outstanding TDLib requests)
+        //    and stop the executor (no new sends).
+        // 4. Drop the channel.
+        synchronized(pendingReplies) {
+            for (reply in pendingReplies) {
+                reply.runnable?.let { mainHandler.removeCallbacks(it) }
+            }
+            pendingReplies.clear()
+        }
+        detached = true
         channel?.setMethodCallHandler(null)
         channel = null
+        appContext = null
         closeClientBestEffort()
         executor.shutdown()
     }
@@ -125,11 +210,111 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
             "getMyId" -> getMyId(result)
             "logOut" -> sendAndAwait(TdApi.LogOut(), result)
             "close" -> close(result)
+            "getNoBackupFilesDirectory" -> getNoBackupFilesDirectory(result)
+            "setTestReplyDelay" -> setTestReplyDelay(call, result)
+            "clearTestReplyDelays" -> clearTestReplyDelays(result)
+            "getTestSendCounts" -> getTestSendCounts(result)
             "dispose" -> {
                 closeClientBestEffort()
                 result.success(mapOf("ok" to true))
             }
             else -> result.notImplemented()
+        }
+    }
+
+    // ---------- no-backup directory (permanent) ----------
+
+    /**
+     * Returns the Android no-backup files directory
+     * (`Context.getNoBackupFilesDir()`), which the OS excludes from
+     * Auto Backup. The TDLib database lives under it so a backup can
+     * never restore a database without its (Keystore-bound) key.
+     * Permanent (not a test hook).
+     */
+    private fun getNoBackupFilesDirectory(result: MethodChannel.Result) {
+        val dir = appContext?.noBackupFilesDir?.absolutePath
+        if (dir == null) {
+            result.error(
+                "bridge_no_backup_dir",
+                "No-backup directory is unavailable.",
+                null,
+            )
+        } else {
+            result.success(mapOf("path" to dir))
+        }
+    }
+
+    // ---------- test-only reply delay (BuildConfig.DEBUG only) ----------
+
+    /**
+     * Arms a reply delay for one delayable TDLib method
+     * (`setTdlibParameters` or `logOut`). The request is still sent
+     * immediately; only the delivery of its result to Dart is delayed
+     * by [delayMs]. A delay of 0 removes the entry. Debug builds only;
+     * in release this reports `notImplemented`.
+     */
+    private fun setTestReplyDelay(call: MethodCall, result: MethodChannel.Result) {
+        if (!BuildConfig.DEBUG) {
+            result.notImplemented()
+            return
+        }
+        val method = call.stringArg("method")
+        val delayMs = call.numberArg("delayMs")?.toLong()
+        if (method == null || delayMs == null || delayMs < 0 ||
+            (method != "setTdlibParameters" && method != "logOut")
+        ) {
+            result.error(
+                "bridge_invalid_args",
+                "setTestReplyDelay requires method (setTdlibParameters or " +
+                    "logOut) and delayMs >= 0.",
+                null,
+            )
+            return
+        }
+        synchronized(testReplyDelays) {
+            if (delayMs == 0L) {
+                testReplyDelays.remove(method)
+            } else {
+                testReplyDelays[method] = delayMs
+            }
+        }
+        result.success(mapOf("ok" to true))
+    }
+
+    /** Clears all armed reply delays. Debug builds only. */
+    private fun clearTestReplyDelays(result: MethodChannel.Result) {
+        if (!BuildConfig.DEBUG) {
+            result.notImplemented()
+            return
+        }
+        synchronized(testReplyDelays) { testReplyDelays.clear() }
+        result.success(mapOf("ok" to true))
+    }
+
+    /**
+     * How many times each delayable TDLib method was sent to the
+     * native client. Used by D1 to prove no second
+     * `setTdlibParameters` was sent. Debug builds only.
+     */
+    private fun getTestSendCounts(result: MethodChannel.Result) {
+        if (!BuildConfig.DEBUG) {
+            result.notImplemented()
+            return
+        }
+        val counts = synchronized(testSendCounts) { testSendCounts.toMap() }
+        result.success(counts)
+    }
+
+    /**
+     * The delayable-method key for a TDLib function, or null when the
+     * function is never delayed. Only `SetTdlibParameters` and
+     * `LogOut` are delayable (D1/D3).
+     */
+    private fun delayableMethodKey(function: TdApi.Function<*>): String? {
+        return when (function) {
+            is TdApi.SetTdlibParameters -> "setTdlibParameters"
+            is TdApi.LogOut -> "logOut"
+            else -> null
         }
     }
 
@@ -267,13 +452,16 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
         val databaseDirectory = call.stringArg("databaseDirectory")
         val filesDirectory = call.stringArg("filesDirectory")
         val applicationVersion = call.stringArg("applicationVersion")
+        val databaseEncryptionKey = call.argument<ByteArray>("databaseEncryptionKey")
         if (apiId == null || apiHash == null || databaseDirectory == null ||
-            filesDirectory == null || applicationVersion == null
+            filesDirectory == null || applicationVersion == null ||
+            databaseEncryptionKey == null || databaseEncryptionKey.size != 32
         ) {
             result.error(
                 "bridge_invalid_args",
                 "setTdlibParameters requires apiId, apiHash, databaseDirectory, " +
-                    "filesDirectory, applicationVersion.",
+                    "filesDirectory, applicationVersion, and a 32-byte " +
+                    "databaseEncryptionKey.",
                 null,
             )
             return
@@ -282,12 +470,16 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
         val filesDir = File(filesDirectory)
         dbDir.mkdirs()
         filesDir.mkdirs()
-        // Exact arguments proven by the isolated spike (Tasks 03/04).
+        // Exact arguments proven by the isolated spike (Tasks 03/04),
+        // except the database encryption key: the spike used an empty
+        // key (unencrypted database). TeleManager always encrypts the
+        // database with the 32-byte key from secure storage (Task 05
+        // Harness); the key is bytes end-to-end and is never logged.
         val params = TdApi.SetTdlibParameters(
             false, // useTestDc
             dbDir.absolutePath,
             filesDir.absolutePath,
-            ByteArray(0), // databaseEncryptionKey: none
+            databaseEncryptionKey,
             true, // useFileDatabase
             true, // useChatInfoDatabase
             true, // useMessageDatabase
@@ -416,8 +608,29 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
      * them must not send to a client TDLib already destroyed. The
      * send only enqueues (async), so holding the lock across it is
      * brief and cannot deadlock.
+     *
+     * Test-only reply delay (BuildConfig.DEBUG only, D1/D3): the
+     * request is sent immediately; only the delivery of its
+     * MethodChannel.Result to Dart is delayed. The delay is captured
+     * at send time, so clearing it later cannot change a request
+     * already sent. Authorization-state updates are unaffected (they
+     * travel on the separate `onAuthorizationState` channel, never
+     * through here). The lock is never held across the delay.
      */
     private fun sendAndAwait(function: TdApi.Function<*>, result: MethodChannel.Result) {
+        // Capture the armed delay (if any) and count the send, before
+        // sending. Both are brief, non-blocking, and debug-only.
+        val delayKey = delayableMethodKey(function)
+        val delayMs: Long? = if (BuildConfig.DEBUG && delayKey != null) {
+            synchronized(testReplyDelays) { testReplyDelays[delayKey] }
+        } else {
+            null
+        }
+        if (BuildConfig.DEBUG && delayKey != null) {
+            synchronized(testSendCounts) {
+                testSendCounts[delayKey] = (testSendCounts[delayKey] ?: 0) + 1
+            }
+        }
         synchronized(clientLock) {
             val c = client
             if (c == null) {
@@ -439,7 +652,7 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
             c.send(
                 function,
                 { obj ->
-                    mainHandler.post {
+                    scheduleDelivery(result, delayMs) {
                         when (obj) {
                             is TdApi.Ok -> result.success(mapOf("ok" to true))
                             is TdApi.Error -> result.error(obj.code.toString(), obj.message, null)
@@ -452,7 +665,7 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
                     }
                 },
                 { e ->
-                    mainHandler.post {
+                    scheduleDelivery(result, delayMs) {
                         result.error(
                             "bridge_exception",
                             "${e.javaClass.simpleName}: ${e.message}",
@@ -461,6 +674,34 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
                     }
                 },
             )
+        }
+    }
+
+    /**
+     * Schedules the delivery of a TDLib result to Dart. With no armed
+     * delay (the normal case, and always in release builds) the result
+     * is posted to the main thread immediately. With an armed delay
+     * (debug only) the result is held in a [PendingReply] and
+     * delivered after the delay. The TDLib callback returns
+     * immediately in both cases; the reply is never lost while the
+     * engine is attached (a Dart timeout does not discard it — it is
+     * delivered late, which is what releases the Dart pending entry).
+     * Delivery is exactly once, on the main thread, and never after
+     * detach (see [PendingReply] and [onDetachedFromEngine]).
+     */
+    private fun scheduleDelivery(
+        result: MethodChannel.Result,
+        delayMs: Long?,
+        deliverAction: () -> Unit,
+    ) {
+        val reply = PendingReply(result, deliverAction)
+        synchronized(pendingReplies) { pendingReplies.add(reply) }
+        val runnable = Runnable { reply.deliver() }
+        reply.runnable = runnable
+        if (delayMs != null && delayMs > 0) {
+            mainHandler.postDelayed(runnable, delayMs)
+        } else {
+            mainHandler.post(runnable)
         }
     }
 

@@ -3,12 +3,15 @@
 // outside this library, while the fields are intentionally private, so
 // initializing formals cannot apply here.
 import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
 
 import '../account_capabilities.dart';
 import '../auth_state.dart';
 import '../capability_status.dart';
 import '../provider_error.dart';
 import '../storage_provider.dart';
+import 'tdlib_database_key_store.dart';
 import 'tdlib_method_channel.dart';
 import 'telegram_auth_steps.dart';
 import 'telegram_credentials_store.dart';
@@ -28,7 +31,9 @@ import 'telegram_errors.dart';
 ///
 /// Never logs, and never puts credentials, session data, or the QR link
 /// into errors, results, or diagnostics (PROJECT_RULES #16). The QR link
-/// lives inside [TelegramOtherDeviceStep] in memory only.
+/// lives inside [TelegramOtherDeviceStep] in memory only. The TDLib
+/// database encryption key is handled the same way: it is bytes
+/// end-to-end, read through [TdlibDatabaseKeyStore], and never logged.
 final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   // Public named parameters (`bridge:` etc.) are part of the API used by
   // callers outside this library, while the fields are intentionally
@@ -36,17 +41,20 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   TelegramProvider({
     required TdlibBridge bridge,
     required TelegramCredentialsStore credentialsStore,
+    required TdlibDatabaseKeyStore databaseKeyStore,
     required String databaseDirectory,
     required String filesDirectory,
     this.applicationVersion = '1.0.0',
     this.closeWaitTimeout = const Duration(seconds: 8),
   }) : _bridge = bridge,
        _credentialsStore = credentialsStore,
+       _databaseKeyStore = databaseKeyStore,
        _databaseDirectory = databaseDirectory,
        _filesDirectory = filesDirectory;
 
   final TdlibBridge _bridge;
   final TelegramCredentialsStore _credentialsStore;
+  final TdlibDatabaseKeyStore _databaseKeyStore;
   final String _databaseDirectory;
   final String _filesDirectory;
 
@@ -188,12 +196,29 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
     _emit(const AuthAuthenticating());
     _throwIfPendingRequest(TdlibBridge.setTdlibParametersMethod);
     try {
+      // Resolve the database encryption key before sending the
+      // parameters. The key is generated ONLY when no database exists
+      // yet; an existing database without a stored key fails loudly
+      // (see TdlibDatabaseKeyStore) and never silently regenerates.
+      // A key error is a ProviderError, so it is caught below and
+      // returned as AuthFailed like any other parameter failure.
+      final databaseExists = await _databaseExists();
+      if (generation != _authenticateGeneration) {
+        return _cancelledAuthenticateResult();
+      }
+      final Uint8List databaseKey = await _databaseKeyStore.getOrCreateKey(
+        databaseExists: databaseExists,
+      );
+      if (generation != _authenticateGeneration) {
+        return _cancelledAuthenticateResult();
+      }
       await _bridge.setTdlibParameters(
         apiId: apiId,
         apiHash: apiHash,
         databaseDirectory: _databaseDirectory,
         filesDirectory: _filesDirectory,
         applicationVersion: applicationVersion,
+        databaseEncryptionKey: databaseKey,
       );
     } on ProviderError catch (e) {
       // A late Error (including the technical timeout) must not
@@ -212,6 +237,27 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
     // _waitForTerminalAuthState checks the generation first, so a
     // stale attempt never creates a waiter for the new client.
     return _waitForTerminalAuthState(generation);
+  }
+
+  /// Whether a TDLib database already exists at [_databaseDirectory].
+  ///
+  /// "Exists" means the directory exists and is non-empty (it holds a
+  /// previous database or other files). The exact filenames are not
+  /// assumed. When the directory cannot be inspected, this is
+  /// conservative and returns `true`, so no new key is generated over
+  /// a database we cannot see; a missing key then fails loudly in
+  /// [TdlibDatabaseKeyStore.getOrCreateKey].
+  Future<bool> _databaseExists() async {
+    try {
+      final dir = Directory(_databaseDirectory);
+      if (!await dir.exists()) return false;
+      await for (final _ in dir.list(followLinks: false)) {
+        return true;
+      }
+      return false;
+    } catch (_) {
+      return true;
+    }
   }
 
   Future<AuthState> _waitForTerminalAuthState(int generation) {

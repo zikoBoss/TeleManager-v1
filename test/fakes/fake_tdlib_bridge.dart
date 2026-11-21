@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:telemanager/providers/provider_error.dart';
 import 'package:telemanager/providers/telegram/tdlib_method_channel.dart';
@@ -38,6 +39,13 @@ final class FakeTdlibBridge implements TdlibBridge {
   String? lastApiHash;
   String? lastPhoneNumber;
   String? lastCode;
+
+  /// Database encryption key passed to the last [setTdlibParameters]
+  /// call (test key bytes; never logged). `null` when never called.
+  Uint8List? lastDatabaseEncryptionKey;
+
+  /// Path returned by [getNoBackupFilesDirectory]. Tests may change it.
+  String noBackupFilesDirectory = '/no-backup';
 
   /// my_id returned by [getMyId]. `0` simulates "no user".
   int myId;
@@ -181,10 +189,12 @@ final class FakeTdlibBridge implements TdlibBridge {
     required String databaseDirectory,
     required String filesDirectory,
     required String applicationVersion,
+    required Uint8List databaseEncryptionKey,
   }) async {
     setTdlibParametersCalls++;
     lastApiId = apiId;
     lastApiHash = apiHash;
+    lastDatabaseEncryptionKey = databaseEncryptionKey;
     final failure = failNextSetTdlibParameters;
     failNextSetTdlibParameters = null;
     if (failure != null) throw failure;
@@ -261,6 +271,9 @@ final class FakeTdlibBridge implements TdlibBridge {
     // Mirror reality: the native side emits Closed after Close.
     emitAuthUpdate(const TdlibAuthUpdate(state: 'AuthorizationStateClosed'));
   }
+
+  @override
+  Future<String> getNoBackupFilesDirectory() async => noBackupFilesDirectory;
 
   @override
   Future<void> dispose() async {

@@ -6,6 +6,7 @@ import 'package:telemanager/providers/storage_provider.dart';
 import 'package:telemanager/providers/telegram/telegram_provider.dart';
 
 import '../fakes/fake_credentials_store.dart';
+import '../fakes/fake_database_key_store.dart';
 import '../fakes/fake_storage_provider.dart';
 import '../fakes/fake_tdlib_bridge.dart';
 
@@ -102,6 +103,7 @@ void main() {
     create: () => TelegramProvider(
       bridge: FakeTdlibBridge(),
       credentialsStore: FakeTelegramCredentialsStore(),
+      databaseKeyStore: FakeTdlibDatabaseKeyStore(),
       databaseDirectory: 'db',
       filesDirectory: 'db/files',
     ),
@@ -113,6 +115,7 @@ void main() {
       final provider = TelegramProvider(
         bridge: bridge,
         credentialsStore: store,
+        databaseKeyStore: FakeTdlibDatabaseKeyStore(),
         databaseDirectory: 'db',
         filesDirectory: 'db/files',
       );

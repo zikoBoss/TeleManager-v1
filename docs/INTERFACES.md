@@ -48,6 +48,41 @@ abstract interface class StorageProvider {
 
 المستهلكون: TM-Transfer وطبقة التطبيق (وميزة المصادقة لخطوات Telegram).
 
+### `TdlibDatabaseKeyStore` — مفتاح تشفير قاعدة TDLib (دائم)
+الملف: `lib/providers/telegram/tdlib_database_key_store.dart`. التنفيذ: `SecureTdlibDatabaseKeyStore` (عبر `flutter_secure_storage`، مدعوم بـ Android Keystore).
+
+المسؤولية: تخزين مفتاح تشفير قاعدة بيانات TDLib (32 بايت، AES-256) واسترجاعه بأمان. المفتاح بايتات من البداية إلى النهاية؛ لا يُسجَّل ولا يُعرض ولا يظهر في أي خطأ أو تشخيص (ولا حتى بصيغة Base64).
+
+التواقيع (Dart):
+```dart
+abstract interface class TdlibDatabaseKeyStore {
+  Future<Uint8List?> readKey();
+  Future<Uint8List> createKey();
+  Future<void> clearKey();
+  Future<Uint8List> getOrCreateKey({required bool databaseExists});
+}
+```
+
+القواعد (ملزمة):
+- يُولَّد المفتاح **فقط** عند عدم وجود قاعدة بيانات (`databaseExists == false`). وقاعدة موجودة دون مفتاح مخزَّن = فشل صريح `ProviderUnknown('tdlib_database_key_missing')`، ولا توليد صامت أبدًا (لأن توليد مفتاح جديد فوق قاعدة موجودة يُيتم الجلسة).
+- مفتاح مخزَّن تالف (Base64 خاطئ أو طول ≠ 32 بايتًا) = `ProviderUnknown('tdlib_database_key_corrupt')` عند وجود قاعدة؛ وعند عدم وجود قاعدة يُمسح التالف ويُولَّد مفتاح جديد.
+- فشل `flutter_secure_storage` (قراءة/كتابة/حذف) = `ProviderUnknown('tdlib_database_key_unreadable')`، ولا بديل صامت بمفتاح فارغ أبدًا.
+- المتصلون المتزامنون يشتركون في عملية واحدة جارية (single-flight، نفس نمط `_authenticateFuture`)، فلا يُولَّد المفتاح ولا يُحفظ مرتين. والفحص والقراءة والتوليد والحفظ كلها داخل العملية المُسلسلة. والذاكرة المؤقتة داخل الذاكرة تُمسح عند `clearKey()`.
+- `clearKey()` يُستخدم فقط مع حذف مجلد قاعدة البيانات معًا (إجراء "إعادة ضبط جلسة الاختبار" في الـ Harness)؛ ولا يُحذف المفتاح وحده أبدًا.
+
+المستهلك: `TelegramProvider._authenticate()` (يقرأ المفتاح ويمرره إلى `setTdlibParameters` قبل إرسال المعاملات؛ فخطأ المفتاح يُرجع `AuthFailed` مثل أي خطأ معاملات).
+
+### `TdlibBridge` — إضافات (دائمة + مؤقتة)
+الملف: `lib/providers/telegram/tdlib_method_channel.dart` (Dart) و`android/native/tdlib_bridge/TdlibBridge.kt` (Kotlin).
+
+**دائم:**
+- `setTdlibParameters` يكتسب معاملًا مطلوبًا `databaseEncryptionKey` (Uint8List، 32 بايتًا، يُرسل ثنائيًا ولا يُسجَّل). والجسر يرفض `bridge_invalid_args` إن كان المفتاح غائبًا أو طوله ≠ 32، ويمرره إلى `TdApi.SetTdlibParameters` بدل `ByteArray(0)` (القاعدة غير المشفرة سابقًا). ونفس المفتاح يجب تمريره في كل تشغيل، وإلا لم تُفتح القاعدة.
+- `getNoBackupFilesDirectory()` يُرجع مسار `Context.getNoBackupFilesDir()` (مستثنًى من Auto Backup بالتعريف). وقاعدة TDLib تعيش في `<no-backup>/tdlib` (والملفات في `<no-backup>/tdlib/files`)، فلا يمكن لنسخة احتياطية استعادة قاعدة دون مفتاحها (Keystore لا يُنسخ احتياطيًا معها). والجسر يخزّن `applicationContext` في `onAttachedToEngine` لهذا الغرض.
+
+**مؤقت (اختبار فقط، يُحذف مع الـ Harness):**
+- `setTestReplyDelay(method, delayMs)` و`clearTestReplyDelays()` و`getTestSendCounts()` — طرق قناة debug فقط (`BuildConfig.DEBUG`؛ وفي release تُرجع `notImplemented`). وهي **ليست** جزءًا من واجهة `TdlibBridge` بل من التطبيق الخرساني `MethodChannelTdlibBridge`، ويستدعيها الـ Harness فقط عبر `HarnessTestHooks`.
+- آلية التأخير: الطلب يُرسل إلى TDLib فورًا؛ ويُؤخَّر **تسليم** `MethodChannel.Result` إلى Dart فقط (لـ `SetTdlibParameters` و`LogOut` فقط). والرد محفوظ في `PendingReply` (تسليم مرة واحدة عبر `AtomicBoolean` + حارس `detached`/`channel != null` + `try/catch`، وعلى الخيط الرئيسي). ومهلة Dart لا تُسقط الرد (يُسلَّم متأخرًا ويحرّر الإدخال المعلق)؛ والفصل وحده يُسقطه. و`onDetachedFromEngine` بترتيب دقيق: إلغاء الاستدعاءات المؤجلة ← علامة `detached` ← إغلاق العميل ← إيقاف المنفذ ← `channel = null`. وقناة تحديثات المصادقة (`onAuthorizationState`) لا تُمسّ أبدًا (فـ `Closed` والحالات الأخرى فورية).
+
 ### `StorageOperations` — يملكه TM-Cloud (معرّف في المهمة 05، يُنفَّذ في المهمة 06)
 الملف: `lib/providers/storage_operations.dart`.
 
@@ -82,6 +117,36 @@ abstract interface class StorageOperations {
 
 ### عقود TM-Backup وTM-Sync وTM-Cache
 المسؤوليات: النسخ المشفر والاستعادة؛ سجل التغييرات وتعارضاته؛ وسياسة Cache. لم تنشأ واجهاتها أو مخطط التشفير/التعارض التنفيذي بعد.
+
+### Test Harness — مؤقت (Task 05، D1–D5)
+الملفات: `lib/features/developer/harness/` (الـ Controller والشاشة وQR ونموذج بيانات الاعتماد والسجل/التنقية وخطافات الاختبار ونقطة الدخول) + نقطة دخول `kDebugMode` في `lib/main.dart` + اعتماد `qr_flutter` في `pubspec.yaml`.
+
+المسؤولية: شاشة تطوير مؤقتة تختبر `TelegramProvider` وطبقة TDLib فعليًا على جهاز Android (المصادقة وإعادة المصادقة والخروج وإغلاق العميل وإنشاء مزوّد جديد)، باستخدام الطبقات الحقيقية (لا Fake على الجهاز). تُحذف كاملةً بعد D1–D5 (مع آلية التأخير وعدّاد الإرسال ونقطة الدخول و`qr_flutter` إن لم تستخدمه الواجهة النهائية). وما يبقى دائمًا: مفتاح تشفير القاعدة ومسار `no_backup` (انظر `TdlibDatabaseKeyStore` و`TdlibBridge` أعلاه).
+
+العقد (Dart):
+```dart
+final class HarnessController extends ChangeNotifier {
+  static Future<HarnessController> create(); // مزوّد حقيقي + مسارات no-backup
+  Future<void> initialize();
+  Future<void> authenticate();
+  Future<void> signOut();
+  Future<void> disposeProvider();
+  Future<void> createNewProvider();
+  Future<void> resetTestSession(); // حذف القاعدة + المفتاح معًا، متحقق منه
+  Future<void> setReplyDelay(String method, int delayMs); // debug فقط
+  Future<void> clearReplyDelays();
+  Future<void> saveCredentials(int apiId, String apiHash);
+  // الحالة: authState وmyId (على الشاشة فقط) وlastError وkeyStatus
+  // وsendCounts ومؤشرات pending/unresolved وeventLog (منقّى).
+}
+```
+
+القواعد (ملزمة):
+- لا Fake على الجهاز: المزوّد الحقيقي + الجسر الحقيقي + TDLib الحقيقية.
+- لا أسرار في السجل أو التقارير أبدًا: لا بيانات اعتماد ولا أرقام هواتف ولا رموز ولا كلمات مرور ولا روابط QR ولا مسارات قواعد ولا مفاتيح (فقط "المفتاح موجود: نعم/لا"). و`my_id` على الشاشة فقط؛ وفي السجل "مطابق للمتوقع: نعم/لا" فقط. والرابط يُعرض كصورة QR فقط (جهاز ثانٍ يمسحه) ولا يُعرض كنص ولا يُسجَّل.
+- `resetTestSession()` يرفض عند وجود طلب معلّق أو غير محسوم (يجب وصول الرد المتأخر وتحرير الإدخال أولًا)؛ ثم `dispose()`؛ ثم حذف مجلد القاعدة **ومسح المفتاح معًا**؛ ثم التحقق من كليهما (المجلد ذهب + `readKey() == null`) قبل إعلان النجاح؛ ولا يُنشئ مزوّدًا جديدًا (يُنشأ صراحةً بعدها). وبيانات الاعتماد تبقى. وSpike لا يُمسّ أبدًا (حزمة ومسار بيانات مختلفان).
+- رابط `tg://` خيار تجريبي غير مضمون ولا يُستخدم في D2؛ والجهاز الثاني هو الطريقة المعتمدة لمسح QR.
+- التأخير debug فقط (`BuildConfig.DEBUG`)؛ وD1: `setTdlibParameters` 15000ms؛ وD3: `logOut` 35000ms؛ ويُمسح قبل D2/D4/D5.
 
 ## نموذج بيانات وحدود دائمة
 - كل ملف ومجلد يحمل UUID داخليًا ثابتًا.

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -53,6 +54,7 @@ void main() {
       databaseDirectory: '/tmp/db',
       filesDirectory: '/tmp/files',
       applicationVersion: '1.0.0',
+      databaseEncryptionKey: Uint8List(32),
     );
 
     test('a timeout marks the request unresolved', () async {

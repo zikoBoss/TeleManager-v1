@@ -1,4 +1,7 @@
+import 'package:flutter/foundation.dart';
 import 'package:material_ui/material_ui.dart';
+
+import 'features/developer/harness/harness_entry.dart';
 
 void main() {
   runApp(const MyApp());
@@ -109,6 +112,19 @@ class _MyHomePageState extends State<MyHomePage> {
               '$_counter',
               style: Theme.of(context).textTheme.headlineMedium,
             ),
+            // Temporary Test Harness entry (Task 05, D1–D5). Debug
+            // builds only; removed with the Harness.
+            if (kDebugMode) ...[
+              const SizedBox(height: 24),
+              ElevatedButton(
+                onPressed: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const HarnessEntryPage()),
+                  );
+                },
+                child: const Text('Open Test Harness (debug)'),
+              ),
+            ],
           ],
         ),
       ),
