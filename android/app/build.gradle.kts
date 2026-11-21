@@ -18,7 +18,12 @@ android {
         applicationId = "com.example.telemanager"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // Task 05: TDLib core:0.1.1 declares minSdk 26 in its manifest
+        // (verified in Task 03 Phase 1); the manifest merger rejects the
+        // Flutter default (24). Do not lower this or use
+        // tools:overrideLibrary — the library may use APIs unavailable
+        // below 26.
+        minSdk = 26
         targetSdk = flutter.targetSdkVersion
         // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
         // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
