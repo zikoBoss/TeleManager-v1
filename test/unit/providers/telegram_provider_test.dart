@@ -897,7 +897,11 @@ void main() {
       );
       await provider.initialize();
       final authFuture = provider.authenticate();
-      // Drive the attempt to the user-wait (the completer exists).
+      // Let authenticate() reach the user-wait first (it emits
+      // Authenticating, then waits): a state update emitted before
+      // that is processed first and then overwritten by
+      // Authenticating, so the wait would never be observed.
+      await pumpEventQueue();
       bridge.emitAuthUpdate(
         const TdlibAuthUpdate(state: 'AuthorizationStateWaitPhoneNumber'),
       );
@@ -940,6 +944,7 @@ void main() {
       );
       await provider.initialize();
       final authFuture = provider.authenticate();
+      await pumpEventQueue(); // let authenticate reach the user-wait
       bridge.emitAuthUpdate(
         const TdlibAuthUpdate(state: 'AuthorizationStateWaitPhoneNumber'),
       );
@@ -1085,6 +1090,7 @@ void main() {
       );
       await provider.initialize();
       final authFuture = provider.authenticate();
+      await pumpEventQueue(); // let authenticate reach the user-wait
       bridge.emitAuthUpdate(
         const TdlibAuthUpdate(state: 'AuthorizationStateWaitPhoneNumber'),
       );
