@@ -296,8 +296,325 @@ void main() {
       },
     );
 
+    test('signOut times out without Closed, does not re-initialize, '
+        'and leaves the provider unusable', () async {
+      final bridge = FakeTdlibBridge();
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+        closeWaitTimeout: const Duration(milliseconds: 50),
+      );
+      await provider.initialize();
+      bridge.onSetTdlibParameters = bridge.emitReady;
+      await provider.authenticate();
+      expect(provider.currentAuthState, isA<AuthAuthenticated>());
+      // No Closed is ever emitted: the wait must time out, throw,
+      // and never re-initialize (the old client may still be
+      // closing). Recovery is dispose + a new provider.
+      await expectLater(provider.signOut(), throwsA(isA<ProviderNetwork>()));
+      expect(bridge.logOutCalls, 1);
+      expect(bridge.initializeCalls, 1);
+      expect(bridge.clientAlive, isFalse);
+      // The provider is unusable after the unresolved timeout:
+      // every later call that would touch the bridge is refused
+      // (before sending anything), even though no Closed arrived.
+      await expectLater(
+        provider.authenticate(),
+        throwsA(
+          isA<ProviderUnknown>().having(
+            (e) => e.providerCode,
+            'providerCode',
+            'provider_unusable_after_logout',
+          ),
+        ),
+      );
+      await expectLater(provider.signOut(), throwsA(isA<ProviderUnknown>()));
+      await expectLater(provider.initialize(), throwsA(isA<ProviderUnknown>()));
+      await provider.dispose();
+    });
+
+    test('setTdlibParameters timeout is unresolved, then a late Ok moves '
+        'the state to AwaitingInput', () async {
+      final bridge = FakeTdlibBridge()
+        ..failNextSetTdlibParameters = const ProviderRequestUnresolved(
+          'setTdlibParameters',
+        );
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
+      await provider.initialize();
+      // The timeout is not a failure: authenticate completes with
+      // AuthFailed carrying the unresolved error (not ProviderNetwork).
+      final state = await provider.authenticate();
+      expect(state, isA<AuthFailed>());
+      final error = (state as AuthFailed).error;
+      expect(error, isA<ProviderRequestUnresolved>());
+      expect((error as ProviderRequestUnresolved).method, 'setTdlibParameters');
+      expect(bridge.setTdlibParametersCalls, 1);
+      // The late Ok arrives as a state update (the parameters were
+      // applied): the state machine moves to AwaitingInput. The
+      // provider does not retry on its own.
+      bridge.emitAuthUpdate(
+        const TdlibAuthUpdate(state: 'AuthorizationStateWaitPhoneNumber'),
+      );
+      await pumpEventQueue();
+      expect(provider.currentAuthState, isA<AuthAwaitingInput>());
+      expect(bridge.setTdlibParametersCalls, 1);
+      await provider.dispose();
+    });
+
+    test('setTdlibParameters timeout then no update leaves the state '
+        'unchanged', () async {
+      final bridge = FakeTdlibBridge()
+        ..failNextSetTdlibParameters = const ProviderRequestUnresolved(
+          'setTdlibParameters',
+        );
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
+      await provider.initialize();
+      final state = await provider.authenticate();
+      expect(state, isA<AuthFailed>());
+      expect((state as AuthFailed).error, isA<ProviderRequestUnresolved>());
+      // A late Error produces no state update (the bridge discards
+      // the late method result, covered by the real-bridge test),
+      // so the state stays AuthFailed with the unresolved error.
+      await pumpEventQueue();
+      expect(provider.currentAuthState, isA<AuthFailed>());
+      expect(
+        (provider.currentAuthState as AuthFailed).error,
+        isA<ProviderRequestUnresolved>(),
+      );
+      expect(bridge.setTdlibParametersCalls, 1);
+      await provider.dispose();
+    });
+
+    test('retry is refused while the previous request is unresolved', () async {
+      final bridge = FakeTdlibBridge();
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
+      await provider.initialize();
+      // Hang the first submitCode (the native request is
+      // outstanding), then mark it unresolved (the Dart timeout
+      // fired). A retry must be refused without sending.
+      bridge.hangNextCall(TdlibBridge.checkAuthenticationCodeMethod);
+      final first = provider.submitCode('12345');
+      await pumpEventQueue();
+      expect(bridge.checkCodeCalls, 1);
+      expect(
+        bridge.hasPendingRequest(TdlibBridge.checkAuthenticationCodeMethod),
+        isTrue,
+      );
+      bridge.timeoutHungCall(TdlibBridge.checkAuthenticationCodeMethod);
+      expect(
+        bridge.isRequestUnresolved(TdlibBridge.checkAuthenticationCodeMethod),
+        isTrue,
+      );
+      await expectLater(
+        provider.submitCode('12345'),
+        throwsA(isA<ProviderRequestUnresolved>()),
+      );
+      expect(bridge.checkCodeCalls, 1);
+      // The late native reply arrives: the entry is cleared and a
+      // retry is allowed.
+      bridge.resolveHungCall(TdlibBridge.checkAuthenticationCodeMethod);
+      await first;
+      expect(
+        bridge.hasPendingRequest(TdlibBridge.checkAuthenticationCodeMethod),
+        isFalse,
+      );
+      await provider.submitCode('12345');
+      expect(bridge.checkCodeCalls, 2);
+      await provider.dispose();
+    });
+
+    test('a correct auth update after a timeout still authenticates', () async {
+      final bridge = FakeTdlibBridge();
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
+      await provider.initialize();
+      // Drive the flow to WaitCode first (so submitCode is valid).
+      bridge.emitAuthUpdate(
+        const TdlibAuthUpdate(
+          state: 'AuthorizationStateWaitCode',
+          codeInfo: {
+            'type': {
+              'name': 'AuthenticationCodeTypeTelegramMessage',
+              'length': 5,
+            },
+            'nextType': null,
+            'timeoutSeconds': 0,
+          },
+        ),
+      );
+      await pumpEventQueue();
+      expect(provider.currentAuthState, isA<AuthAwaitingInput>());
+      // submitCode times out, but the code was accepted: Ready
+      // arrives and the provider authenticates (the timeout must
+      // not block a correct update).
+      bridge.hangNextCall(TdlibBridge.checkAuthenticationCodeMethod);
+      final submitFuture = provider.submitCode('12345');
+      await pumpEventQueue();
+      bridge.resolveHungCall(
+        TdlibBridge.checkAuthenticationCodeMethod,
+        error: const ProviderRequestUnresolved('checkAuthenticationCode'),
+      );
+      await expectLater(
+        submitFuture,
+        throwsA(isA<ProviderRequestUnresolved>()),
+      );
+      bridge.emitReady();
+      await pumpEventQueue();
+      expect(provider.currentAuthState, isA<AuthAuthenticated>());
+      await provider.dispose();
+    });
+
+    test('auth updates after dispose are ignored', () async {
+      final bridge = FakeTdlibBridge()..closeStreamsOnDispose = false;
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
+      await provider.initialize();
+      bridge.onSetTdlibParameters = bridge.emitReady;
+      await provider.authenticate();
+      expect(provider.currentAuthState, isA<AuthAuthenticated>());
+      await provider.dispose();
+      // The fake's streams are still open (closeStreamsOnDispose is
+      // false), so an update can still be emitted — but the provider
+      // cancelled its subscription in dispose(), so it must not move.
+      bridge.emitAuthUpdate(
+        const TdlibAuthUpdate(state: 'AuthorizationStateWaitCode'),
+      );
+      await pumpEventQueue();
+      expect(provider.currentAuthState, isA<AuthAuthenticated>());
+    });
+
     test(
-      'signOut times out without Closed and does not re-initialize',
+      'logOut timeout then a late Closed leaves the provider unusable',
+      () async {
+        final bridge = FakeTdlibBridge()
+          ..failNextLogOut = const ProviderRequestUnresolved('logOut');
+        final provider = createProvider(
+          bridge: bridge,
+          store: storedCredentials(),
+        );
+        await provider.initialize();
+        bridge.onSetTdlibParameters = bridge.emitReady;
+        await provider.authenticate();
+        expect(provider.currentAuthState, isA<AuthAuthenticated>());
+        // logOut times out: signOut throws the unresolved error and
+        // the provider becomes unusable.
+        await expectLater(
+          provider.signOut(),
+          throwsA(isA<ProviderRequestUnresolved>()),
+        );
+        expect(bridge.logOutCalls, 1);
+        expect(bridge.initializeCalls, 1);
+        // The late Closed still arrives and the state becomes
+        // Unauthenticated (the state machine stays truthful) — but
+        // the provider is NOT reusable: the late Closed alone is not
+        // enough.
+        bridge.emitAuthUpdate(
+          const TdlibAuthUpdate(state: 'AuthorizationStateClosed'),
+        );
+        await pumpEventQueue();
+        expect(provider.currentAuthState, isA<AuthUnauthenticated>());
+        await expectLater(
+          provider.authenticate(),
+          throwsA(isA<ProviderUnknown>()),
+        );
+        await expectLater(provider.signOut(), throwsA(isA<ProviderUnknown>()));
+        await expectLater(
+          provider.initialize(),
+          throwsA(isA<ProviderUnknown>()),
+        );
+        // dispose() still works (it is never blocked by the flag).
+        await provider.dispose();
+      },
+    );
+
+    test(
+      'all reuse is refused after a logOut timeout, before dispose',
+      () async {
+        final bridge = FakeTdlibBridge()
+          ..failNextLogOut = const ProviderRequestUnresolved('logOut');
+        final provider = createProvider(
+          bridge: bridge,
+          store: storedCredentials(),
+        );
+        await provider.initialize();
+        bridge.onSetTdlibParameters = bridge.emitReady;
+        await provider.authenticate();
+        await expectLater(
+          provider.signOut(),
+          throwsA(isA<ProviderRequestUnresolved>()),
+        );
+        // The state is still Authenticated (no Closed arrived), yet
+        // every method that would touch the bridge is refused.
+        expect(provider.currentAuthState, isA<AuthAuthenticated>());
+        await expectLater(
+          provider.getAccountCapabilities(),
+          throwsA(isA<ProviderUnknown>()),
+        );
+        await expectLater(
+          provider.submitPhoneNumber('+123'),
+          throwsA(isA<ProviderUnknown>()),
+        );
+        await expectLater(
+          provider.submitCode('12345'),
+          throwsA(isA<ProviderUnknown>()),
+        );
+        await expectLater(
+          provider.submitPassword('secret'),
+          throwsA(isA<ProviderUnknown>()),
+        );
+        await expectLater(
+          provider.requestQrLogin(),
+          throwsA(isA<ProviderUnknown>()),
+        );
+        // No bridge call was sent by any of the refused methods.
+        expect(bridge.setPhoneNumberCalls, 0);
+        expect(bridge.checkCodeCalls, 0);
+        expect(bridge.checkPasswordCalls, 0);
+        expect(bridge.requestQrCalls, 0);
+        await provider.dispose();
+      },
+    );
+
+    test('concurrent signOut calls return the identical Future', () async {
+      final bridge = FakeTdlibBridge();
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
+      await provider.initialize();
+      bridge.onSetTdlibParameters = bridge.emitReady;
+      await provider.authenticate();
+      final f1 = provider.signOut();
+      final f2 = provider.signOut();
+      expect(identical(f1, f2), isTrue);
+      await pumpEventQueue(); // let signOut reach the Closed wait
+      expect(bridge.logOutCalls, 1);
+      expect(bridge.initializeCalls, 1);
+      bridge.emitAuthUpdate(
+        const TdlibAuthUpdate(state: 'AuthorizationStateClosed'),
+      );
+      await f1;
+      await f2;
+      expect(bridge.logOutCalls, 1);
+      expect(bridge.initializeCalls, 2);
+      await provider.dispose();
+    });
+
+    test(
+      'concurrent signOut calls share the Closed-wait timeout failure',
       () async {
         final bridge = FakeTdlibBridge();
         final provider = createProvider(
@@ -308,17 +625,124 @@ void main() {
         await provider.initialize();
         bridge.onSetTdlibParameters = bridge.emitReady;
         await provider.authenticate();
-        expect(provider.currentAuthState, isA<AuthAuthenticated>());
-        // No Closed is ever emitted: the wait must time out, throw,
-        // and never re-initialize (the old client may still be
-        // closing). Recovery is dispose + a new provider.
-        await expectLater(provider.signOut(), throwsA(isA<ProviderNetwork>()));
+        final f1 = provider.signOut();
+        final f2 = provider.signOut();
+        expect(identical(f1, f2), isTrue);
+        await expectLater(f1, throwsA(isA<ProviderNetwork>()));
+        await expectLater(f2, throwsA(isA<ProviderNetwork>()));
         expect(bridge.logOutCalls, 1);
         expect(bridge.initializeCalls, 1);
-        expect(bridge.clientAlive, isFalse);
         await provider.dispose();
       },
     );
+
+    test('concurrent signOut calls share the logOut timeout failure', () async {
+      final bridge = FakeTdlibBridge()
+        ..failNextLogOut = const ProviderRequestUnresolved('logOut');
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
+      await provider.initialize();
+      bridge.onSetTdlibParameters = bridge.emitReady;
+      await provider.authenticate();
+      final f1 = provider.signOut();
+      final f2 = provider.signOut();
+      expect(identical(f1, f2), isTrue);
+      await expectLater(f1, throwsA(isA<ProviderRequestUnresolved>()));
+      await expectLater(f2, throwsA(isA<ProviderRequestUnresolved>()));
+      expect(bridge.logOutCalls, 1);
+      expect(bridge.initializeCalls, 1);
+      // A later call is a NEW operation (the first one finished),
+      // so it is refused as unusable, not a share of f1.
+      await expectLater(
+        provider.signOut(),
+        throwsA(
+          isA<ProviderUnknown>().having(
+            (e) => e.providerCode,
+            'providerCode',
+            'provider_unusable_after_logout',
+          ),
+        ),
+      );
+      await provider.dispose();
+    });
+
+    test(
+      'second signOut during dispose returns the identical Future',
+      () async {
+        final bridge = FakeTdlibBridge();
+        final provider = createProvider(
+          bridge: bridge,
+          store: storedCredentials(),
+        );
+        await provider.initialize();
+        bridge.onSetTdlibParameters = bridge.emitReady;
+        await provider.authenticate();
+        // signOut waits for Closed (never emitted).
+        final f1 = provider.signOut();
+        await pumpEventQueue(); // let signOut reach the Closed wait
+        // dispose() is called but NOT awaited: synchronously after
+        // it, the in-flight signOut must still be returned (identical),
+        // not a new Future.error from the disposed guard.
+        final disposeFuture = provider.dispose();
+        final f2 = provider.signOut();
+        expect(identical(f1, f2), isTrue);
+        await disposeFuture;
+        await expectLater(f1, throwsA(isA<ProviderUnknown>()));
+        await expectLater(f2, throwsA(isA<ProviderUnknown>()));
+      },
+    );
+
+    test('dispose during in-flight logOut fails signOut promptly', () async {
+      final bridge = FakeTdlibBridge();
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
+      await provider.initialize();
+      bridge.onSetTdlibParameters = bridge.emitReady;
+      await provider.authenticate();
+      // Hang logOut (the native request is outstanding).
+      bridge.hangNextCall(TdlibBridge.logOutMethod);
+      final signOutFuture = provider.signOut();
+      await pumpEventQueue(); // let signOut reach the logOut await
+      await provider.dispose();
+      // The late native reply arrives (logOut completes after
+      // dispose): signOut must fail promptly with provider_disposed
+      // (via the _throwIfDisposed check after logOut), not wait
+      // 8s for a Closed that will never be delivered.
+      bridge.resolveHungCall(TdlibBridge.logOutMethod);
+      await expectLater(
+        signOutFuture,
+        throwsA(
+          isA<ProviderUnknown>().having(
+            (e) => e.providerCode,
+            'providerCode',
+            'provider_disposed',
+          ),
+        ),
+      );
+    });
+
+    test('_onReady after dispose does not emit Authenticated', () async {
+      final bridge = FakeTdlibBridge();
+      final provider = createProvider(
+        bridge: bridge,
+        store: storedCredentials(),
+      );
+      await provider.initialize();
+      // Hang getMyId: Ready arrives but the account id is not read yet.
+      bridge.hangNextCall(TdlibBridge.getMyIdMethod);
+      bridge.emitReady();
+      await pumpEventQueue(); // let _onReady reach the getMyId await
+      await provider.dispose();
+      // The late my_id arrives after dispose: it must be dropped,
+      // not emitted as Authenticated on a dead provider.
+      bridge.resolveHungCall(TdlibBridge.getMyIdMethod);
+      await pumpEventQueue();
+      expect(provider.currentAuthState, isA<AuthUnauthenticated>());
+    });
 
     test('dispose closes the native client and rejects further use', () async {
       final bridge = FakeTdlibBridge();

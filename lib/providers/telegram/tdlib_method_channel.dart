@@ -73,11 +73,39 @@ final class TdlibError {
 /// Method calls that TDLib rejects surface as the mapped
 /// [ProviderError] (see [_mapPlatformException]).
 abstract interface class TdlibBridge {
+  /// MethodChannel method names, defined once so the provider's
+  /// pending-request checks and the bridge's invocations can never
+  /// disagree about a name.
+  static const String initializeMethod = 'initialize';
+  static const String setTdlibParametersMethod = 'setTdlibParameters';
+  static const String setAuthenticationPhoneNumberMethod =
+      'setAuthenticationPhoneNumber';
+  static const String checkAuthenticationCodeMethod = 'checkAuthenticationCode';
+  static const String checkAuthenticationPasswordMethod =
+      'checkAuthenticationPassword';
+  static const String requestQrCodeAuthenticationMethod =
+      'requestQrCodeAuthentication';
+  static const String getOptionVersionMethod = 'getOptionVersion';
+  static const String getMyIdMethod = 'getMyId';
+  static const String logOutMethod = 'logOut';
+  static const String closeMethod = 'close';
+  static const String disposeMethod = 'dispose';
+
   /// Authorization-state notifications from the native client.
   Stream<TdlibAuthUpdate> get authUpdates;
 
   /// Unsolicited TDLib errors (client error handler).
   Stream<TdlibError> get errors;
+
+  /// Whether a request for [method] is currently outstanding — still
+  /// executing, or timed out but not yet answered. The provider
+  /// refuses a duplicate send while this is true.
+  bool hasPendingRequest(String method);
+
+  /// Whether a request for [method] timed out and its native result
+  /// has not arrived yet. Diagnostics only; [hasPendingRequest]
+  /// covers both the in-flight and the unresolved case.
+  bool isRequestUnresolved(String method);
 
   /// Loads tdjni and creates the TDLib client. The client starts in
   /// `AuthorizationStateWaitTdlibParameters`.
@@ -91,7 +119,8 @@ abstract interface class TdlibBridge {
   });
 
   /// Sends `SetTdlibParameters` (api id/hash, directories, version).
-  /// Times out after 10s ([ProviderNetwork]) if TDLib does not answer.
+  /// Times out after 10s ([ProviderRequestUnresolved]) if TDLib does
+  /// not answer.
   Future<void> setTdlibParameters({
     required int apiId,
     required String apiHash,
@@ -120,10 +149,10 @@ abstract interface class TdlibBridge {
   Future<int> getMyId();
 
   /// Sends `LogOut` (wipes the session, per user choice). Times out
-  /// after 30s ([ProviderNetwork]) if TDLib does not answer; a
-  /// timeout does not prove the logout did not happen (the native
-  /// logout may still complete and the Closed state may still arrive
-  /// on [authUpdates]).
+  /// after 30s ([ProviderRequestUnresolved]) if TDLib does not
+  /// answer; a timeout does not prove the logout did not happen (the
+  /// native logout may still complete and the Closed state may still
+  /// arrive on [authUpdates]).
   Future<void> logOut();
 
   /// Sends `Close` and waits for the `Closed` state (up to 8s).
@@ -135,20 +164,58 @@ abstract interface class TdlibBridge {
   Future<void> dispose();
 }
 
+/// One outstanding native call. A timeout never removes the entry:
+/// it only sets [timedOut]. The entry is removed only when the native
+/// reply eventually arrives (on time or late), so a timeout is never
+/// mistaken for a cancellation and an older request's late result
+/// never drops a newer request's entry. A `Set<String>` would be
+/// insufficient: two requests of the same method can be outstanding
+/// at once (a retry after a timeout, or two concurrent step calls),
+/// and clearing the method name on the first late result would wrongly
+/// allow a third request while the second is still pending.
+final class _PendingRequest {
+  _PendingRequest({required this.id, required this.method});
+
+  final int id;
+  final String method;
+
+  /// True once the Dart-side timeout fired. The native request is
+  /// still outstanding; only its reply clears the entry.
+  var timedOut = false;
+}
+
 /// MethodChannel implementation of [TdlibBridge].
 ///
 /// Channel `telemanager.tdlib`. Native callbacks arrive as method
 /// calls: `onAuthorizationState` and `onError`.
 final class MethodChannelTdlibBridge implements TdlibBridge {
-  MethodChannelTdlibBridge([MethodChannel? channel])
+  /// Creates the bridge on [channel] (or the `telemanager.tdlib`
+  /// channel). [timeoutOverride] replaces every per-method Dart-side
+  /// timeout when set; it exists only so tests can trigger the
+  /// unresolved-request path quickly. Production code never sets it.
+  MethodChannelTdlibBridge([MethodChannel? channel, this.timeoutOverride])
     : _channel = channel ?? const MethodChannel('telemanager.tdlib') {
     _channel.setMethodCallHandler(_handleMethodCall);
   }
+
+  /// Replaces every per-method Dart-side timeout when set. Test-only.
+  final Duration? timeoutOverride;
 
   final MethodChannel _channel;
   final _authUpdates = StreamController<TdlibAuthUpdate>.broadcast();
   final _errors = StreamController<TdlibError>.broadcast();
   var _disposed = false;
+
+  var _nextRequestId = 0;
+  final Map<int, _PendingRequest> _pendingRequests = {};
+
+  @override
+  bool hasPendingRequest(String method) =>
+      _pendingRequests.values.any((r) => r.method == method);
+
+  @override
+  bool isRequestUnresolved(String method) =>
+      _pendingRequests.values.any((r) => r.method == method && r.timedOut);
 
   @override
   Stream<TdlibAuthUpdate> get authUpdates => _authUpdates.stream;
@@ -177,7 +244,7 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
     required String databaseDirectory,
     required String filesDirectory,
   }) async {
-    await _invoke('initialize', {
+    await _invoke(TdlibBridge.initializeMethod, {
       'databaseDirectory': databaseDirectory,
       'filesDirectory': filesDirectory,
     });
@@ -191,7 +258,7 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
     required String filesDirectory,
     required String applicationVersion,
   }) async {
-    await _invoke('setTdlibParameters', {
+    await _invoke(TdlibBridge.setTdlibParametersMethod, {
       'apiId': apiId,
       'apiHash': apiHash,
       'databaseDirectory': databaseDirectory,
@@ -202,21 +269,21 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
 
   @override
   Future<void> setAuthenticationPhoneNumber(String phoneNumber) async {
-    await _invoke('setAuthenticationPhoneNumber', {
+    await _invoke(TdlibBridge.setAuthenticationPhoneNumberMethod, {
       'phoneNumber': phoneNumber,
     }, timeout: const Duration(seconds: 30));
   }
 
   @override
   Future<void> checkAuthenticationCode(String code) async {
-    await _invoke('checkAuthenticationCode', {
+    await _invoke(TdlibBridge.checkAuthenticationCodeMethod, {
       'code': code,
     }, timeout: const Duration(seconds: 30));
   }
 
   @override
   Future<void> checkAuthenticationPassword(String password) async {
-    await _invoke('checkAuthenticationPassword', {
+    await _invoke(TdlibBridge.checkAuthenticationPasswordMethod, {
       'password': password,
     }, timeout: const Duration(seconds: 30));
   }
@@ -224,7 +291,7 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
   @override
   Future<void> requestQrCodeAuthentication() async {
     await _invoke(
-      'requestQrCodeAuthentication',
+      TdlibBridge.requestQrCodeAuthenticationMethod,
       {},
       timeout: const Duration(seconds: 30),
     );
@@ -232,24 +299,28 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
 
   @override
   Future<String> getOptionVersion() async {
-    final result = await _invoke('getOptionVersion', {});
+    final result = await _invoke(TdlibBridge.getOptionVersionMethod, {});
     return (result as Map)['value'] as String;
   }
 
   @override
   Future<int> getMyId() async {
-    final result = await _invoke('getMyId', {});
+    final result = await _invoke(TdlibBridge.getMyIdMethod, {});
     return (result as Map)['myId'] as int;
   }
 
   @override
   Future<void> logOut() async {
-    await _invoke('logOut', {}, timeout: const Duration(seconds: 30));
+    await _invoke(
+      TdlibBridge.logOutMethod,
+      {},
+      timeout: const Duration(seconds: 30),
+    );
   }
 
   @override
   Future<void> close() async {
-    await _invoke('close', {});
+    await _invoke(TdlibBridge.closeMethod, {});
   }
 
   @override
@@ -257,7 +328,7 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
     if (_disposed) return;
     _disposed = true;
     try {
-      await _channel.invokeMethod('dispose', {});
+      await _channel.invokeMethod(TdlibBridge.disposeMethod, {});
     } on PlatformException {
       // Best-effort: dispose must never throw.
     } on MissingPluginException {
@@ -268,27 +339,62 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
   }
 
   /// Invokes a native method. When [timeout] is given, a technical
-  /// request that TDLib never answers fails with [ProviderNetwork]
-  /// instead of hanging forever. The user-wait that follows a request
-  /// (for phone/code/QR input) is not a method call and has no timeout.
+  /// request that TDLib never answers fails with
+  /// [ProviderRequestUnresolved] instead of hanging forever — the
+  /// native request is still outstanding and may still complete, so
+  /// the timeout is never treated as a cancellation. The user-wait
+  /// that follows a request (for phone/code/QR input) is not a method
+  /// call and has no timeout.
+  ///
+  /// Every call is tracked by a unique request id (see
+  /// [_PendingRequest]): the entry is removed only when the native
+  /// reply arrives (on time or late). A timeout only marks it
+  /// unresolved. The provider reads the tracking through
+  /// [hasPendingRequest] / [isRequestUnresolved] and refuses a
+  /// duplicate send while a previous request is outstanding.
   Future<Object?> _invoke(
     String method,
     Map<String, Object?> args, {
     Duration? timeout,
   }) async {
+    // Register synchronously, before the first await, so the
+    // registration is atomic in Dart's single-threaded event loop:
+    // no second call can slip in between a duplicate check and
+    // this insert.
+    final id = _nextRequestId++;
+    final pending = _PendingRequest(id: id, method: method);
+    _pendingRequests[id] = pending;
     try {
       final future = _channel.invokeMethod(method, args);
-      if (timeout == null) return await future;
+      // Clear the entry when the native reply eventually arrives, on
+      // time or late, with a value or an error. Never on timeout: the
+      // request is still outstanding until the native side answers.
+      // `then` with both handlers (not `whenComplete`) so the derived
+      // future completes normally in both cases and never surfaces
+      // an unhandled async error.
+      unawaited(
+        future.then(
+          (_) => _pendingRequests.remove(id),
+          onError: (_, _) => _pendingRequests.remove(id),
+        ),
+      );
+      final effectiveTimeout = timeoutOverride ?? timeout;
+      if (effectiveTimeout == null) return await future;
       return await future.timeout(
-        timeout,
+        effectiveTimeout,
         onTimeout: () {
-          throw ProviderNetwork('Timed out waiting for TDLib ($method).');
+          pending.timedOut = true;
+          throw ProviderRequestUnresolved(
+            method,
+            'Timed out waiting for TDLib ($method); the request is '
+            'still unresolved.',
+          );
         },
       );
     } on ProviderError {
       rethrow;
     } on PlatformException catch (e) {
-      throw _mapPlatformException(e);
+      throw _mapPlatformException(e, method);
     } on MissingPluginException {
       throw const ProviderUnknown(
         'missing_plugin',
@@ -302,14 +408,21 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
 /// [ProviderError]. The native side reports TDLib errors with the
 /// numeric TDLib code as the exception code, so they route through
 /// [mapTdlibError]; bridge-internal errors use `bridge_*` codes.
-ProviderError _mapPlatformException(PlatformException e) {
+ProviderError _mapPlatformException(PlatformException e, String method) {
   final tdlibCode = int.tryParse(e.code);
   if (tdlibCode != null) {
     return mapTdlibError(tdlibCode, e.message ?? '');
   }
   switch (e.code) {
     case 'bridge_timeout':
-      return ProviderNetwork(e.message ?? 'Timed out waiting for TDLib.');
+      // The native operation did not answer in time (getMyId's 5s
+      // latch, close's 8s latch). Its outcome is unknown, not a
+      // confirmed network failure — and the method name is kept so
+      // the caller knows which request is unresolved.
+      return ProviderRequestUnresolved(
+        method,
+        e.message ?? 'Timed out waiting for TDLib.',
+      );
     case 'bridge_not_initialized':
       return const ProviderNotInitialized('TDLib bridge is not initialized.');
     case 'bridge_disposed':

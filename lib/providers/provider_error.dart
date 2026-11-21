@@ -46,7 +46,9 @@ final class ProviderUnauthenticated extends ProviderError {
   final String message;
 }
 
-/// Network failure, timeout, or unreachable provider.
+/// Confirmed network failure or unreachable provider. A timeout of a
+/// technical TDLib request is NOT a network failure: it is
+/// [ProviderRequestUnresolved] (the native request may still complete).
 final class ProviderNetwork extends ProviderError {
   const ProviderNetwork([this.message = 'Network error.']);
 
@@ -55,6 +57,30 @@ final class ProviderNetwork extends ProviderError {
 
   @override
   final String message;
+}
+
+/// A technical request timed out, but its outcome is unknown: the
+/// native request is still outstanding and may still succeed. This is
+/// NOT a confirmed network failure ([ProviderNetwork]) — the caller
+/// must not assume the request failed, and must not re-send it while
+/// it is unresolved (the bridge refuses duplicates). [method] names
+/// the technical method that timed out (or whose previous request is
+/// still outstanding); it is kept in the error details so the caller
+/// knows which request is unresolved.
+final class ProviderRequestUnresolved extends ProviderError {
+  const ProviderRequestUnresolved(
+    this.method, [
+    this.message = 'Request timed out and is still unresolved.',
+  ]);
+
+  @override
+  String get code => 'request_unresolved';
+
+  @override
+  final String message;
+
+  /// The technical method (e.g. `'setTdlibParameters'`).
+  final String method;
 }
 
 /// The account limit was exceeded (size, count, or quota).

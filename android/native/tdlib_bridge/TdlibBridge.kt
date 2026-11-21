@@ -46,6 +46,19 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
     private var closedLatch: CountDownLatch? = null
     private var closedObserved = false
 
+    // Serializes every read/write of client / closedObserved /
+    // closedLatch / clientGeneration. The lock is held only for brief,
+    // non-blocking work (checks, flag updates, enqueuing a send or a
+    // fire-and-forget channel publish); the latch awaits happen
+    // outside it, so no deadlock is possible.
+    private val clientLock = Any()
+
+    // Increments on every initialize(). Handlers capture the
+    // generation at Client.create time; an update or error whose
+    // generation no longer matches the current one belongs to an old
+    // client and is dropped before it can reach Dart.
+    private var clientGeneration = 0
+
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel = MethodChannel(binding.binaryMessenger, "telemanager.tdlib")
         channel?.setMethodCallHandler(this)
@@ -133,24 +146,6 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
             )
             return
         }
-        // Fail fast: never create a second client while a previous one
-        // is still open (not confirmed closed). The Dart side waits for
-        // the Closed state before re-initializing after signOut; if
-        // this guard fires, the caller skipped that wait (a sequencing
-        // bug). The check must come before closeClientBestEffort(),
-        // which drops the reference.
-        if (client != null && !closedObserved) {
-            result.error(
-                "bridge_previous_client_open",
-                "A previous TDLib client is still open; wait for Closed " +
-                    "before initializing.",
-                null,
-            )
-            return
-        }
-        // Defensive: a previous client (e.g. after a failed attempt) is
-        // closed best-effort before creating a new one.
-        closeClientBestEffort()
         try {
             System.loadLibrary("tdjni")
         } catch (e: Throwable) {
@@ -161,35 +156,79 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
             )
             return
         }
-        closedObserved = false
-        client = Client.create(
-            { update ->
-                if (update is TdApi.UpdateAuthorizationState) {
-                    onAuthState(update.authorizationState)
-                }
-            },
-            { e -> postError(0, e.message ?: "update handler error") },
-            { e -> postError(0, e.message ?: "default handler error") },
-        )
+        // Fail fast: never create a second client while a previous one
+        // is still open (not confirmed closed). The Dart side waits for
+        // the Closed state before re-initializing after signOut; if
+        // this guard fires, the caller skipped that wait (a sequencing
+        // bug). The check must come before closeClientBestEffort(),
+        // which drops the reference.
+        //
+        // The guard, the generation increment, the defensive close,
+        // the flag reset, and the Client.create happen inside one
+        // synchronized block, so no update handler can interleave
+        // between them. (Client.create does not synchronously invoke
+        // its handlers — TDLib delivers updates on its own thread —
+        // so creating the client while holding the lock cannot
+        // deadlock.)
+        synchronized(clientLock) {
+            if (client != null && !closedObserved) {
+                result.error(
+                    "bridge_previous_client_open",
+                    "A previous TDLib client is still open; wait for Closed " +
+                        "before initializing.",
+                    null,
+                )
+                return
+            }
+            // Defensive: a previous client (e.g. after a failed
+            // attempt) is closed best-effort before creating a new one.
+            closeClientBestEffortLocked()
+            clientGeneration++
+            val generation = clientGeneration
+            closedObserved = false
+            client = Client.create(
+                { update ->
+                    if (update is TdApi.UpdateAuthorizationState) {
+                        onAuthState(update.authorizationState, generation)
+                    }
+                },
+                { e -> postError(0, e.message ?: "update handler error", generation) },
+                { e -> postError(0, e.message ?: "default handler error", generation) },
+            )
+        }
         result.success(mapOf("ok" to true))
     }
 
     private fun close(result: MethodChannel.Result) {
-        val c = client
-        if (c == null || closedObserved) {
-            client = null
-            result.success(mapOf("ok" to true))
-            return
-        }
-        executor.execute {
-            val latch = CountDownLatch(1)
+        // Check, latch install, and send inside one lock hold, so a
+        // Closed arriving between them cannot leave the latch
+        // installed after the client already closed (which would wait
+        // the full 8s for a countdown that already happened). The
+        // latch await itself happens outside the lock (otherwise
+        // onAuthState could never acquire the lock to count it down).
+        val latch = CountDownLatch(1)
+        synchronized(clientLock) {
+            val c = client
+            if (c == null || closedObserved) {
+                client = null
+                result.success(mapOf("ok" to true))
+                return
+            }
             closedLatch = latch
             c.send(TdApi.Close(), { _ -> }, { _ -> })
+        }
+        executor.execute {
             val confirmed = latch.await(8, TimeUnit.SECONDS)
-            closedLatch = null
             mainHandler.post {
-                if (confirmed) {
-                    client = null
+                // A Closed that arrived before the latch was installed
+                // still counts: the client is gone either way.
+                val closed = synchronized(clientLock) {
+                    closedLatch = null
+                    val ok = confirmed || closedObserved
+                    if (ok) client = null
+                    ok
+                }
+                if (closed) {
                     result.success(mapOf("ok" to true))
                 } else {
                     result.error(
@@ -204,6 +243,13 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     /** Best-effort close: sends Close and drops the reference. Never waits. */
     private fun closeClientBestEffort() {
+        synchronized(clientLock) {
+            closeClientBestEffortLocked()
+        }
+    }
+
+    /** Best-effort close, assuming [clientLock] is held. */
+    private fun closeClientBestEffortLocked() {
         val c = client ?: return
         client = null
         try {
@@ -284,20 +330,34 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     /** Async `GetOption("my_id")` with the spike's 5s timeout. */
     private fun getMyId(result: MethodChannel.Result) {
-        val c = client
-        if (c == null) {
-            result.error(
-                "bridge_not_initialized",
-                "TDLib client is not initialized.",
-                null,
-            )
-            return
-        }
-        executor.execute {
-            val latch = CountDownLatch(1)
-            var value: Long? = null
-            var problem: String? = null
-            var problemCode: Int? = null
+        // Check and send on the calling (platform) thread, inside the
+        // lock, so a Closed arriving between them cannot send to a
+        // client that is already gone. Only the latch await runs on
+        // the executor. (The locals are written by the TDLib thread
+        // in the send callbacks and read by the executor after the
+        // latch await; the latch provides the happens-before edge.)
+        val latch = CountDownLatch(1)
+        var value: Long? = null
+        var problem: String? = null
+        var problemCode: Int? = null
+        synchronized(clientLock) {
+            val c = client
+            if (c == null) {
+                result.error(
+                    "bridge_not_initialized",
+                    "TDLib client is not initialized.",
+                    null,
+                )
+                return
+            }
+            if (closedObserved) {
+                result.error(
+                    "bridge_client_closed",
+                    "TDLib client is closed.",
+                    null,
+                )
+                return
+            }
             c.send(
                 TdApi.GetOption("my_id"),
                 { obj ->
@@ -317,6 +377,8 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
                     latch.countDown()
                 },
             )
+        }
+        executor.execute {
             val received = latch.await(5, TimeUnit.SECONDS)
             mainHandler.post {
                 when {
@@ -349,64 +411,128 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
      * Sends a TDLib function and replies when its result arrives.
      * `TdApi.Ok` -> success; `TdApi.Error` -> error with the numeric
      * TDLib code so Dart can map it. Replies on the platform thread.
+     *
+     * Check and send inside one lock hold: a Closed arriving between
+     * them must not send to a client TDLib already destroyed. The
+     * send only enqueues (async), so holding the lock across it is
+     * brief and cannot deadlock.
      */
     private fun sendAndAwait(function: TdApi.Function<*>, result: MethodChannel.Result) {
-        val c = client
-        if (c == null) {
-            result.error(
-                "bridge_not_initialized",
-                "TDLib client is not initialized.",
-                null,
-            )
-            return
-        }
-        c.send(
-            function,
-            { obj ->
-                mainHandler.post {
-                    when (obj) {
-                        is TdApi.Ok -> result.success(mapOf("ok" to true))
-                        is TdApi.Error -> result.error(obj.code.toString(), obj.message, null)
-                        else -> result.error(
-                            "bridge_unexpected",
-                            "Unexpected response: ${obj.javaClass.simpleName}",
+        synchronized(clientLock) {
+            val c = client
+            if (c == null) {
+                result.error(
+                    "bridge_not_initialized",
+                    "TDLib client is not initialized.",
+                    null,
+                )
+                return
+            }
+            if (closedObserved) {
+                result.error(
+                    "bridge_client_closed",
+                    "TDLib client is closed.",
+                    null,
+                )
+                return
+            }
+            c.send(
+                function,
+                { obj ->
+                    mainHandler.post {
+                        when (obj) {
+                            is TdApi.Ok -> result.success(mapOf("ok" to true))
+                            is TdApi.Error -> result.error(obj.code.toString(), obj.message, null)
+                            else -> result.error(
+                                "bridge_unexpected",
+                                "Unexpected response: ${obj.javaClass.simpleName}",
+                                null,
+                            )
+                        }
+                    }
+                },
+                { e ->
+                    mainHandler.post {
+                        result.error(
+                            "bridge_exception",
+                            "${e.javaClass.simpleName}: ${e.message}",
                             null,
                         )
                     }
-                }
-            },
-            { e ->
-                mainHandler.post {
-                    result.error(
-                        "bridge_exception",
-                        "${e.javaClass.simpleName}: ${e.message}",
-                        null,
-                    )
-                }
-            },
-        )
+                },
+            )
+        }
     }
 
     // ---------- updates ----------
 
-    private fun onAuthState(state: TdApi.AuthorizationState) {
-        if (state is TdApi.AuthorizationStateClosed) {
-            closedObserved = true
-            closedLatch?.countDown()
+    /**
+     * Authorization-state update from a TDLib client. [generation]
+     * is the generation captured at `Client.create` time.
+     *
+     * Two checks close the publishing race:
+     * - First check (TDLib thread, under the lock): drops a stale
+     *   update early and applies the Closed side effects atomically
+     *   (closedObserved + latch countdown + client nulling), so the
+     *   latch timing stays synchronous with the update.
+     * - Second check (publish time, under the lock): the generation
+     *   check AND the `invokeMethod` happen inside the same lock
+     *   hold, so no `initialize()` can interleave between them. A
+     *   new client created in between makes this update stale and it
+     *   is dropped before it can reach Dart.
+     *
+     * `invokeMethod` is fire-and-forget (no result callback, no wait
+     * for Dart), does not call back into this class, and only encodes
+     * a small map — so holding the lock across it is brief,
+     * non-blocking, and cannot deadlock.
+     */
+    private fun onAuthState(state: TdApi.AuthorizationState, generation: Int) {
+        val shouldPost = synchronized(clientLock) {
+            if (generation != clientGeneration) {
+                false
+            } else {
+                if (state is TdApi.AuthorizationStateClosed) {
+                    closedObserved = true
+                    closedLatch?.countDown()
+                    client = null
+                }
+                true
+            }
         }
-        val payload = mapAuthState(state)
+        if (!shouldPost) return
         mainHandler.post {
-            channel?.invokeMethod("onAuthorizationState", payload, null)
+            synchronized(clientLock) {
+                if (generation == clientGeneration) {
+                    val payload = mapAuthState(state)
+                    channel?.invokeMethod("onAuthorizationState", payload, null)
+                }
+                // else: dropped. The old update must not reach Dart,
+                // must not overtake a newer update, and must not
+                // change the new provider's state.
+            }
         }
     }
 
-    private fun postError(code: Int, message: String) {
+    /**
+     * Unsolicited TDLib error. Same two-check, atomic-publish
+     * pattern as [onAuthState]: a stale error must not overwrite the
+     * new client's `lastError`.
+     */
+    private fun postError(code: Int, message: String, generation: Int) {
+        val shouldPost = synchronized(clientLock) {
+            generation == clientGeneration
+        }
+        if (!shouldPost) return
         mainHandler.post {
-            channel?.invokeMethod(
-                "onError",
-                mapOf("code" to code, "message" to message),
-                null,
-            )
+            synchronized(clientLock) {
+                if (generation == clientGeneration) {
+                    channel?.invokeMethod(
+                        "onError",
+                        mapOf("code" to code, "message" to message),
+                        null,
+                    )
+                }
+            }
         }
     }
 

@@ -72,6 +72,16 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   Future<AuthState>? _authenticateFuture;
   Completer<AuthState>? _authCompleter;
   Completer<void>? _closedCompleter;
+
+  /// Set when a `logOut` (or the following Closed wait) timed out:
+  /// the old client may still be closing, so this provider is unsafe
+  /// and unusable. A late `Closed` does NOT clear it; only [dispose]
+  /// + a new provider recovers.
+  var _logoutUnresolved = false;
+
+  /// In-flight `signOut()` operation (single-flight). Concurrent
+  /// callers share this exact [Future] object (identical).
+  Future<void>? _signOutFuture;
   StreamSubscription<TdlibAuthUpdate>? _authUpdatesSub;
   StreamSubscription<TdlibError>? _errorsSub;
 
@@ -88,6 +98,7 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   @override
   Future<void> initialize() async {
     _throwIfDisposed();
+    _throwIfUnusable();
     if (_initialized) return;
     final inFlight = _initializeFuture;
     if (inFlight != null) return inFlight;
@@ -122,6 +133,7 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   @override
   Future<AuthState> authenticate() async {
     _throwIfDisposed();
+    _throwIfUnusable();
     _throwIfNotInitialized();
     if (_currentAuthState is AuthAuthenticated) return _currentAuthState;
     final inFlight = _authenticateFuture;
@@ -147,6 +159,7 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
       );
     }
     _emit(const AuthAuthenticating());
+    _throwIfPendingRequest(TdlibBridge.setTdlibParametersMethod);
     try {
       await _bridge.setTdlibParameters(
         apiId: apiId,
@@ -173,11 +186,70 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
     return completer.future;
   }
 
+  /// Signs out and re-creates the client. Concurrent callers share the
+  /// same [Future] object (identical), not just the same result.
+  ///
+  /// The public method is deliberately NOT `async`: an `async`
+  /// function always returns a fresh Future wrapping the result, so
+  /// `identical` would be false. Here the stored future is returned
+  /// directly. The in-flight check comes FIRST, before the guards:
+  /// a second call during an in-flight signOut returns the operation
+  /// itself even if the provider has since become disposed or
+  /// unusable (the operation completes with the appropriate error on
+  /// its own). The guards apply only when no operation is in
+  /// progress, so a new operation is never started after dispose()
+  /// or after a logOut timeout.
   @override
-  Future<void> signOut() async {
+  Future<void> signOut() {
+    final inFlight = _signOutFuture;
+    if (inFlight != null) return inFlight;
+    // Guards throw synchronously in a non-async function; convert
+    // them to a failed Future so error delivery matches the async
+    // operation (callers uniformly await / expectLater).
+    try {
+      _throwIfDisposed();
+      _throwIfUnusable();
+      _throwIfNotInitialized();
+    } on ProviderError catch (e) {
+      return Future<void>.error(e);
+    }
+    final future = _signOut();
+    _signOutFuture = future;
+    // Clear the stored future when it settles, success or error, so
+    // a later signOut can start a new operation. `then` with both
+    // handlers (not `whenComplete`) so the derived future completes
+    // normally in both cases — `whenComplete` would mirror the
+    // original's error into an unhandled async error, since nobody
+    // awaits the derived future.
+    unawaited(
+      future.then(
+        (_) {
+          if (identical(_signOutFuture, future)) _signOutFuture = null;
+        },
+        onError: (_) {
+          if (identical(_signOutFuture, future)) _signOutFuture = null;
+        },
+      ),
+    );
+    return future;
+  }
+
+  Future<void> _signOut() async {
+    _throwIfPendingRequest(TdlibBridge.logOutMethod);
+    try {
+      await _bridge.logOut();
+    } on ProviderRequestUnresolved {
+      // The logout request timed out: its outcome is unknown and the
+      // old client may still be closing. This provider is unusable
+      // until dispose() + a new provider; a late Closed alone is not
+      // enough to reuse it.
+      _logoutUnresolved = true;
+      rethrow;
+    }
+    // If dispose() ran while logOut was in flight, fail promptly
+    // instead of waiting up to 8s for a Closed that will never be
+    // delivered (the subscription was cancelled in dispose()).
     _throwIfDisposed();
-    _throwIfNotInitialized();
-    await _bridge.logOut();
     // logOut() returns when the request is accepted, not when the
     // client is closed. The client is only confirmed closed when the
     // Closed state arrives on authStates (the native side sets
@@ -200,6 +272,13 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
             );
           },
         );
+      } on ProviderNetwork {
+        // The Closed wait timed out: same unusable rule as a logOut
+        // timeout. (Only the timeout throws ProviderNetwork here;
+        // dispose() completes this completer with ProviderUnknown,
+        // which is not caught.)
+        _logoutUnresolved = true;
+        rethrow;
       } finally {
         // Clear the waiter whether it completed or timed out; a late
         // Closed is still consumed by _emit (it only moves the state).
@@ -208,7 +287,7 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
     }
     // Closed is confirmed: re-create the client so the next
     // authenticate() works without restarting the app. On an
-    // unresolved timeout the line above throws, so this is never
+    // unresolved timeout the code above throws, so this is never
     // reached while the old client may still be closing.
     await _bridge.initialize(
       databaseDirectory: _databaseDirectory,
@@ -219,6 +298,7 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   @override
   Future<AccountCapabilities> getAccountCapabilities() async {
     _throwIfDisposed();
+    _throwIfUnusable();
     _throwIfNotInitialized();
     final account = _currentAccount;
     if (_currentAuthState is! AuthAuthenticated || account == null) {
@@ -300,28 +380,36 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   @override
   Future<void> submitPhoneNumber(String phoneNumber) async {
     _throwIfDisposed();
+    _throwIfUnusable();
     _throwIfNotInitialized();
+    _throwIfPendingRequest(TdlibBridge.setAuthenticationPhoneNumberMethod);
     await _bridge.setAuthenticationPhoneNumber(phoneNumber);
   }
 
   @override
   Future<void> submitCode(String code) async {
     _throwIfDisposed();
+    _throwIfUnusable();
     _throwIfNotInitialized();
+    _throwIfPendingRequest(TdlibBridge.checkAuthenticationCodeMethod);
     await _bridge.checkAuthenticationCode(code);
   }
 
   @override
   Future<void> submitPassword(String password) async {
     _throwIfDisposed();
+    _throwIfUnusable();
     _throwIfNotInitialized();
+    _throwIfPendingRequest(TdlibBridge.checkAuthenticationPasswordMethod);
     await _bridge.checkAuthenticationPassword(password);
   }
 
   @override
   Future<void> requestQrLogin() async {
     _throwIfDisposed();
+    _throwIfUnusable();
     _throwIfNotInitialized();
+    _throwIfPendingRequest(TdlibBridge.requestQrCodeAuthenticationMethod);
     await _bridge.requestQrCodeAuthentication();
   }
 
@@ -345,6 +433,9 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
       // A newer state arrived while we waited (e.g. Closing): drop
       // this stale result instead of emitting an outdated Authenticated.
       if (generation != _authGeneration) return;
+      // The provider was disposed while we waited: drop the result
+      // instead of emitting Authenticated on a dead provider.
+      if (_disposed) return;
       if (myId == 0) {
         _emit(
           const AuthFailed(
@@ -486,6 +577,35 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
       throw const ProviderUnknown(
         'provider_disposed',
         'TelegramProvider is disposed.',
+      );
+    }
+  }
+
+  /// Throws when this provider is unusable after an unresolved
+  /// logout (see [_logoutUnresolved]). A late Closed does not clear
+  /// it; recovery is [dispose] + a new provider. [dispose] itself
+  /// is never blocked by this check.
+  void _throwIfUnusable() {
+    if (_logoutUnresolved) {
+      throw const ProviderUnknown(
+        'provider_unusable_after_logout',
+        'The provider is unusable after an unresolved logout. '
+            'Dispose it and create a new provider.',
+      );
+    }
+  }
+
+  /// Refuses a duplicate send while a previous request of the same
+  /// method is still outstanding (in flight or timed out but not yet
+  /// answered). The bridge tracks the request; the provider enforces
+  /// the refusal. A timeout is never a cancellation, so the caller
+  /// must not re-send until the late result arrives.
+  void _throwIfPendingRequest(String method) {
+    if (_bridge.hasPendingRequest(method)) {
+      throw ProviderRequestUnresolved(
+        method,
+        'A previous $method request is still outstanding; refusing '
+        'a duplicate send.',
       );
     }
   }
