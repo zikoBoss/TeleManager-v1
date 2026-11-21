@@ -1,3 +1,5 @@
+import 'capability_status.dart';
+
 /// Opaque account identifier, minted by the provider.
 ///
 /// TM-Core treats it as an opaque string. It is an identifier, never a
@@ -24,13 +26,18 @@ final class AccountId {
 /// (TELEGRAM_INTEGRATION.md; PROJECT_RULES #2, #3). All limits come from
 /// a single source inside the provider — never hard-coded in several
 /// places (PROJECT_RULES #2).
+///
+/// Capability flags are [CapabilityStatus], not `bool`: a plain `bool`
+/// cannot tell "unsupported" from "unknown" from "supported by the
+/// library but not implemented in TeleManager yet". See
+/// [CapabilityStatus] for the exact meaning of each value.
 final class AccountCapabilities {
   const AccountCapabilities({
     required this.accountId,
     this.maxFileSizeBytes,
-    this.supportsResumableUpload = false,
-    this.supportsResumableDownload = false,
-    this.supportsStreaming = false,
+    this.supportsResumableUpload = CapabilityStatus.unknown,
+    this.supportsResumableDownload = CapabilityStatus.unknown,
+    this.supportsStreaming = CapabilityStatus.unknown,
     this.maxConcurrentTransfers,
   });
 
@@ -41,15 +48,23 @@ final class AccountCapabilities {
   final int? maxFileSizeBytes;
 
   /// Whether an interrupted upload can be resumed.
-  final bool supportsResumableUpload;
+  ///
+  /// `conditional` means the library supports it but TeleManager does
+  /// not implement it yet (the condition is stated by the provider);
+  /// it never means "implemented now".
+  final CapabilityStatus supportsResumableUpload;
 
   /// Whether an interrupted download can be resumed.
-  final bool supportsResumableDownload;
+  ///
+  /// `conditional` means the library supports it but TeleManager does
+  /// not implement it yet (the condition is stated by the provider);
+  /// it never means "implemented now".
+  final CapabilityStatus supportsResumableDownload;
 
-  /// Whether streaming is supported. Defaults to `false`: never assume
-  /// streaming until tested with the chosen integration
+  /// Whether streaming is supported. Defaults to [CapabilityStatus.unknown]:
+  /// never assume streaming until tested with the chosen integration
   /// (PROJECT_RULES #18).
-  final bool supportsStreaming;
+  final CapabilityStatus supportsStreaming;
 
   /// How many transfers may run concurrently, if the provider states
   /// one. `null` means the provider states no limit.

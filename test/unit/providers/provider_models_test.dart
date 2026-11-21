@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:telemanager/providers/account_capabilities.dart';
 import 'package:telemanager/providers/auth_state.dart';
+import 'package:telemanager/providers/capability_status.dart';
 import 'package:telemanager/providers/provider_error.dart';
 import 'package:telemanager/providers/storage_object.dart';
 import 'package:telemanager/providers/transfer_models.dart';
@@ -39,13 +40,23 @@ void main() {
   });
 
   group('AccountCapabilities', () {
-    test('unknown limits are null by default, streaming is off', () {
+    test('unknown limits are null by default, statuses are unknown', () {
       const caps = AccountCapabilities(accountId: AccountId('1'));
       expect(caps.maxFileSizeBytes, isNull);
-      expect(caps.supportsStreaming, isFalse);
-      expect(caps.supportsResumableUpload, isFalse);
-      expect(caps.supportsResumableDownload, isFalse);
+      expect(caps.supportsStreaming, CapabilityStatus.unknown);
+      expect(caps.supportsResumableUpload, CapabilityStatus.unknown);
+      expect(caps.supportsResumableDownload, CapabilityStatus.unknown);
       expect(caps.maxConcurrentTransfers, isNull);
+    });
+
+    test('CapabilityStatus has four distinct values', () {
+      expect(CapabilityStatus.values, hasLength(4));
+      expect(CapabilityStatus.values.toSet(), {
+        CapabilityStatus.supported,
+        CapabilityStatus.unsupported,
+        CapabilityStatus.unknown,
+        CapabilityStatus.conditional,
+      });
     });
   });
 

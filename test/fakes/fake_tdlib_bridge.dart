@@ -32,9 +32,20 @@ final class FakeTdlibBridge implements TdlibBridge {
   /// my_id returned by [getMyId]. `0` simulates "no user".
   int myId;
 
+  /// Whether a live TDLib client exists. Set by [initialize], cleared
+  /// by [logOut]/[close]/[dispose]. Mirrors the real bridge, where
+  /// `setTdlibParameters` on a closed client fails
+  /// (`bridge_not_initialized`): the fake enforces the same rule so
+  /// the signOut/re-auth lifecycle is testable.
+  var clientAlive = false;
+
   /// Test hook: invoked synchronously inside [setTdlibParameters],
   /// so a test can drive the Ready update at the right moment.
   void Function()? onSetTdlibParameters;
+
+  /// Test hook: invoked synchronously inside [logOut], so a test can
+  /// drive the Closed update while signOut is awaiting logOut.
+  void Function()? onLogOut;
 
   /// When set, the next call to the named method throws this error.
   ProviderError? failNextInitialize;
@@ -67,6 +78,7 @@ final class FakeTdlibBridge implements TdlibBridge {
     final failure = failNextInitialize;
     failNextInitialize = null;
     if (failure != null) throw failure;
+    clientAlive = true;
   }
 
   @override
@@ -83,6 +95,13 @@ final class FakeTdlibBridge implements TdlibBridge {
     final failure = failNextSetTdlibParameters;
     failNextSetTdlibParameters = null;
     if (failure != null) throw failure;
+    // The real bridge rejects calls on a closed client
+    // (`bridge_not_initialized`); enforce the same here so a test
+    // that calls setTdlibParameters after logOut without an
+    // intervening initialize fails the way the real one would.
+    if (!clientAlive) {
+      throw const ProviderNotInitialized('TDLib client is closed.');
+    }
     onSetTdlibParameters?.call();
   }
 
@@ -122,6 +141,11 @@ final class FakeTdlibBridge implements TdlibBridge {
   @override
   Future<void> logOut() async {
     logOutCalls++;
+    onLogOut?.call();
+    // The client is closed by LogOut; the native side then emits
+    // LoggingOut -> Closed. The test drives the Closed update itself
+    // (emitAuthUpdate) so it can control the timing.
+    clientAlive = false;
   }
 
   @override
@@ -130,6 +154,7 @@ final class FakeTdlibBridge implements TdlibBridge {
     final failure = failNextClose;
     failNextClose = null;
     if (failure != null) throw failure;
+    clientAlive = false;
     // Mirror reality: the native side emits Closed after Close.
     emitAuthUpdate(const TdlibAuthUpdate(state: 'AuthorizationStateClosed'));
   }
@@ -137,6 +162,7 @@ final class FakeTdlibBridge implements TdlibBridge {
   @override
   Future<void> dispose() async {
     disposeCalls++;
+    clientAlive = false;
     await _authUpdates.close();
     await _errors.close();
   }

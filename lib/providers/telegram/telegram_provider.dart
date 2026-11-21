@@ -6,6 +6,7 @@ import 'dart:async';
 
 import '../account_capabilities.dart';
 import '../auth_state.dart';
+import '../capability_status.dart';
 import '../provider_error.dart';
 import '../storage_provider.dart';
 import 'tdlib_method_channel.dart';
@@ -38,6 +39,7 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
     required String databaseDirectory,
     required String filesDirectory,
     this.applicationVersion = '1.0.0',
+    this.closeWaitTimeout = const Duration(seconds: 8),
   }) : _bridge = bridge,
        _credentialsStore = credentialsStore,
        _databaseDirectory = databaseDirectory,
@@ -51,6 +53,13 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   /// Version string sent to TDLib as `applicationVersion`.
   final String applicationVersion;
 
+  /// How long [signOut] waits for the `Closed` state after `LogOut`
+  /// before giving up. Matches the native Close timeout (8s). On a
+  /// timeout the provider does NOT re-initialize the bridge (the old
+  /// client may still be closing); the caller should dispose the
+  /// provider and create a new one.
+  final Duration closeWaitTimeout;
+
   final _authStates = StreamController<AuthState>.broadcast();
   AuthState _currentAuthState = const AuthUnauthenticated();
   AccountInfo? _currentAccount;
@@ -62,6 +71,7 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   Future<void>? _initializeFuture;
   Future<AuthState>? _authenticateFuture;
   Completer<AuthState>? _authCompleter;
+  Completer<void>? _closedCompleter;
   StreamSubscription<TdlibAuthUpdate>? _authUpdatesSub;
   StreamSubscription<TdlibError>? _errorsSub;
 
@@ -168,8 +178,42 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
     _throwIfDisposed();
     _throwIfNotInitialized();
     await _bridge.logOut();
-    // LoggingOut -> Closed arrive on authStates and move the provider
-    // to AuthUnauthenticated.
+    // logOut() returns when the request is accepted, not when the
+    // client is closed. The client is only confirmed closed when the
+    // Closed state arrives on authStates (the native side sets
+    // closedObserved before the Dart delivery, so the Dart-side Closed
+    // is the authoritative signal). Wait for it before re-creating
+    // the client: a second client must never be created on the same
+    // database before the first is confirmed closed (Task 03/04).
+    // A completer (completed in _emit) is used instead of firstWhere
+    // on the stream, so a Closed that arrives between the check and
+    // the wait cannot be missed.
+    if (_currentAuthState is! AuthUnauthenticated) {
+      final completer = Completer<void>();
+      _closedCompleter = completer;
+      try {
+        await completer.future.timeout(
+          closeWaitTimeout,
+          onTimeout: () {
+            throw const ProviderNetwork(
+              'Timed out waiting for TDLib to close.',
+            );
+          },
+        );
+      } finally {
+        // Clear the waiter whether it completed or timed out; a late
+        // Closed is still consumed by _emit (it only moves the state).
+        if (identical(_closedCompleter, completer)) _closedCompleter = null;
+      }
+    }
+    // Closed is confirmed: re-create the client so the next
+    // authenticate() works without restarting the app. On an
+    // unresolved timeout the line above throws, so this is never
+    // reached while the old client may still be closing.
+    await _bridge.initialize(
+      databaseDirectory: _databaseDirectory,
+      filesDirectory: _filesDirectory,
+    );
   }
 
   @override
@@ -184,12 +228,25 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
     // API, and the provider must never invent a limit (audit §C). The
     // server's rejection is authoritative. A verified limit may be set
     // here — in this single place — by a later task.
+    //
+    // Capability values (see CapabilityStatus): a capability is
+    // `supported` only when the library API exists AND TeleManager
+    // implements the feature; `conditional` means the library supports
+    // it but TeleManager does not implement it yet (the condition is
+    // stated here, never implied to be implemented now).
     return AccountCapabilities(
       accountId: account.accountId,
       maxFileSizeBytes: null,
-      supportsResumableUpload: false,
-      supportsResumableDownload: false,
-      supportsStreaming: false,
+      // No mechanism in TDLib to resume a message send (SendMessage
+      // is atomic; PreliminaryUploadFile is for voice/video notes
+      // only), and TeleManager does not implement one.
+      supportsResumableUpload: CapabilityStatus.unsupported,
+      // TDLib's DownloadFile supports an offset, but TeleManager does
+      // not use it yet (the provider downloads fresh in Task 06);
+      // offset-based resume is planned for Task 11.
+      supportsResumableDownload: CapabilityStatus.conditional,
+      // Untested (PROJECT_RULES #18): never assume streaming.
+      supportsStreaming: CapabilityStatus.unknown,
       maxConcurrentTransfers: null,
     );
   }
@@ -198,6 +255,18 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
+    // Unblock a signOut() that is waiting for Closed: the provider
+    // is going away, so the wait must not hang until its timeout.
+    final closedCompleter = _closedCompleter;
+    if (closedCompleter != null && !closedCompleter.isCompleted) {
+      _closedCompleter = null;
+      closedCompleter.completeError(
+        const ProviderUnknown(
+          'provider_disposed',
+          'TelegramProvider is disposed.',
+        ),
+      );
+    }
     await _authUpdatesSub?.cancel();
     await _errorsSub?.cancel();
     _authUpdatesSub = null;
@@ -399,6 +468,15 @@ final class TelegramProvider implements StorageProvider, TelegramAuthSteps {
         (state is AuthAuthenticated || state is AuthFailed)) {
       _authCompleter = null;
       completer.complete(state);
+    }
+    // signOut() waits on this: Closed (the only way to become
+    // AuthUnauthenticated) confirms the old client is gone.
+    if (state is AuthUnauthenticated) {
+      final closedCompleter = _closedCompleter;
+      if (closedCompleter != null && !closedCompleter.isCompleted) {
+        _closedCompleter = null;
+        closedCompleter.complete();
+      }
     }
     return state;
   }

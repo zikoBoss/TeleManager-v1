@@ -133,6 +133,21 @@ class TdlibBridge : FlutterPlugin, MethodChannel.MethodCallHandler {
             )
             return
         }
+        // Fail fast: never create a second client while a previous one
+        // is still open (not confirmed closed). The Dart side waits for
+        // the Closed state before re-initializing after signOut; if
+        // this guard fires, the caller skipped that wait (a sequencing
+        // bug). The check must come before closeClientBestEffort(),
+        // which drops the reference.
+        if (client != null && !closedObserved) {
+            result.error(
+                "bridge_previous_client_open",
+                "A previous TDLib client is still open; wait for Closed " +
+                    "before initializing.",
+                null,
+            )
+            return
+        }
         // Defensive: a previous client (e.g. after a failed attempt) is
         // closed best-effort before creating a new one.
         closeClientBestEffort()

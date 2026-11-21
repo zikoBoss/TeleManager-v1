@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:telemanager/providers/auth_state.dart';
+import 'package:telemanager/providers/capability_status.dart';
 import 'package:telemanager/providers/provider_error.dart';
 import 'package:telemanager/providers/telegram/tdlib_method_channel.dart';
 import 'package:telemanager/providers/telegram/telegram_auth_steps.dart';
@@ -11,12 +12,14 @@ import '../../fakes/fake_tdlib_bridge.dart';
 TelegramProvider createProvider({
   FakeTdlibBridge? bridge,
   FakeTelegramCredentialsStore? store,
+  Duration closeWaitTimeout = const Duration(seconds: 8),
 }) {
   return TelegramProvider(
     bridge: bridge ?? FakeTdlibBridge(),
     credentialsStore: store ?? FakeTelegramCredentialsStore(),
     databaseDirectory: 'db',
     filesDirectory: 'db/files',
+    closeWaitTimeout: closeWaitTimeout,
   );
 }
 
@@ -122,9 +125,13 @@ void main() {
       final caps = await provider.getAccountCapabilities();
       expect(caps.accountId.value, '8934661485');
       expect(caps.maxFileSizeBytes, isNull);
-      expect(caps.supportsStreaming, isFalse);
-      expect(caps.supportsResumableUpload, isFalse);
-      expect(caps.supportsResumableDownload, isFalse);
+      // Resumable upload: unsupported (no TDLib mechanism to resume
+      // a message send). Resumable download: conditional (the offset
+      // API exists, TeleManager does not use it yet — Task 11).
+      // Streaming: unknown (untested, PROJECT_RULES #18).
+      expect(caps.supportsResumableUpload, CapabilityStatus.unsupported);
+      expect(caps.supportsResumableDownload, CapabilityStatus.conditional);
+      expect(caps.supportsStreaming, CapabilityStatus.unknown);
       expect(caps.maxConcurrentTransfers, isNull);
       await provider.dispose();
     });
@@ -218,7 +225,52 @@ void main() {
     });
 
     test(
-      'signOut requests logout; Closed returns to unauthenticated',
+      'signOut waits for Closed, re-initializes, and re-auth works',
+      () async {
+        final bridge = FakeTdlibBridge();
+        final provider = createProvider(
+          bridge: bridge,
+          store: storedCredentials(),
+        );
+        await provider.initialize();
+        bridge.onSetTdlibParameters = bridge.emitReady;
+        final firstAuth = await provider.authenticate();
+        expect(firstAuth, isA<AuthAuthenticated>());
+        expect(provider.currentAuthState, isA<AuthAuthenticated>());
+        expect(bridge.initializeCalls, 1);
+        expect(bridge.setTdlibParametersCalls, 1);
+
+        // Start signOut and let it reach the Closed wait; the client
+        // must NOT be re-created yet.
+        final signOutFuture = provider.signOut();
+        await pumpEventQueue();
+        expect(bridge.logOutCalls, 1);
+        expect(bridge.initializeCalls, 1);
+        expect(bridge.clientAlive, isFalse);
+        // Drive Closed: signOut completes and re-creates the client.
+        bridge.emitAuthUpdate(
+          const TdlibAuthUpdate(state: 'AuthorizationStateClosed'),
+        );
+        await signOutFuture;
+        expect(bridge.initializeCalls, 2);
+        expect(bridge.clientAlive, isTrue);
+        expect(provider.currentAuthState, isA<AuthUnauthenticated>());
+
+        // Re-authenticate on the new client (no app restart).
+        bridge.onSetTdlibParameters = bridge.emitReady;
+        final secondAuth = await provider.authenticate();
+        expect(secondAuth, isA<AuthAuthenticated>());
+        expect(
+          (secondAuth as AuthAuthenticated).account.accountId.value,
+          '8934661485',
+        );
+        expect(bridge.setTdlibParametersCalls, 2);
+        await provider.dispose();
+      },
+    );
+
+    test(
+      'signOut skips the Closed wait when Closed arrives during logOut',
       () async {
         final bridge = FakeTdlibBridge();
         final provider = createProvider(
@@ -229,13 +281,41 @@ void main() {
         bridge.onSetTdlibParameters = bridge.emitReady;
         await provider.authenticate();
         expect(provider.currentAuthState, isA<AuthAuthenticated>());
-        await provider.signOut();
-        expect(bridge.logOutCalls, 1);
-        bridge.emitAuthUpdate(
+        // Closed arrives while signOut is awaiting logOut: the wait
+        // must be skipped (the state is already Unauthenticated) and
+        // the client still re-created.
+        bridge.onLogOut = () => bridge.emitAuthUpdate(
           const TdlibAuthUpdate(state: 'AuthorizationStateClosed'),
         );
-        await pumpEventQueue();
+        await provider.signOut();
+        expect(bridge.logOutCalls, 1);
+        expect(bridge.initializeCalls, 2);
+        expect(bridge.clientAlive, isTrue);
         expect(provider.currentAuthState, isA<AuthUnauthenticated>());
+        await provider.dispose();
+      },
+    );
+
+    test(
+      'signOut times out without Closed and does not re-initialize',
+      () async {
+        final bridge = FakeTdlibBridge();
+        final provider = createProvider(
+          bridge: bridge,
+          store: storedCredentials(),
+          closeWaitTimeout: const Duration(milliseconds: 50),
+        );
+        await provider.initialize();
+        bridge.onSetTdlibParameters = bridge.emitReady;
+        await provider.authenticate();
+        expect(provider.currentAuthState, isA<AuthAuthenticated>());
+        // No Closed is ever emitted: the wait must time out, throw,
+        // and never re-initialize (the old client may still be
+        // closing). Recovery is dispose + a new provider.
+        await expectLater(provider.signOut(), throwsA(isA<ProviderNetwork>()));
+        expect(bridge.logOutCalls, 1);
+        expect(bridge.initializeCalls, 1);
+        expect(bridge.clientAlive, isFalse);
         await provider.dispose();
       },
     );

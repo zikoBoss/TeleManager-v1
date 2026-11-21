@@ -81,12 +81,17 @@ abstract interface class TdlibBridge {
 
   /// Loads tdjni and creates the TDLib client. The client starts in
   /// `AuthorizationStateWaitTdlibParameters`.
+  ///
+  /// Fail-fast: refuses (`bridge_previous_client_open`) when a
+  /// previous client is still open (not confirmed closed). The caller
+  /// must wait for the `Closed` state before re-initializing.
   Future<void> initialize({
     required String databaseDirectory,
     required String filesDirectory,
   });
 
   /// Sends `SetTdlibParameters` (api id/hash, directories, version).
+  /// Times out after 10s ([ProviderNetwork]) if TDLib does not answer.
   Future<void> setTdlibParameters({
     required int apiId,
     required String apiHash,
@@ -114,7 +119,11 @@ abstract interface class TdlibBridge {
   /// after authorization; pre-auth it is not available (Task 03).
   Future<int> getMyId();
 
-  /// Sends `LogOut` (wipes the session, per user choice).
+  /// Sends `LogOut` (wipes the session, per user choice). Times out
+  /// after 30s ([ProviderNetwork]) if TDLib does not answer; a
+  /// timeout does not prove the logout did not happen (the native
+  /// logout may still complete and the Closed state may still arrive
+  /// on [authUpdates]).
   Future<void> logOut();
 
   /// Sends `Close` and waits for the `Closed` state (up to 8s).
@@ -188,27 +197,37 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
       'databaseDirectory': databaseDirectory,
       'filesDirectory': filesDirectory,
       'applicationVersion': applicationVersion,
-    });
+    }, timeout: const Duration(seconds: 10));
   }
 
   @override
   Future<void> setAuthenticationPhoneNumber(String phoneNumber) async {
-    await _invoke('setAuthenticationPhoneNumber', {'phoneNumber': phoneNumber});
+    await _invoke('setAuthenticationPhoneNumber', {
+      'phoneNumber': phoneNumber,
+    }, timeout: const Duration(seconds: 30));
   }
 
   @override
   Future<void> checkAuthenticationCode(String code) async {
-    await _invoke('checkAuthenticationCode', {'code': code});
+    await _invoke('checkAuthenticationCode', {
+      'code': code,
+    }, timeout: const Duration(seconds: 30));
   }
 
   @override
   Future<void> checkAuthenticationPassword(String password) async {
-    await _invoke('checkAuthenticationPassword', {'password': password});
+    await _invoke('checkAuthenticationPassword', {
+      'password': password,
+    }, timeout: const Duration(seconds: 30));
   }
 
   @override
   Future<void> requestQrCodeAuthentication() async {
-    await _invoke('requestQrCodeAuthentication', {});
+    await _invoke(
+      'requestQrCodeAuthentication',
+      {},
+      timeout: const Duration(seconds: 30),
+    );
   }
 
   @override
@@ -225,7 +244,7 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
 
   @override
   Future<void> logOut() async {
-    await _invoke('logOut', {});
+    await _invoke('logOut', {}, timeout: const Duration(seconds: 30));
   }
 
   @override
@@ -248,9 +267,26 @@ final class MethodChannelTdlibBridge implements TdlibBridge {
     await _errors.close();
   }
 
-  Future<Object?> _invoke(String method, Map<String, Object?> args) async {
+  /// Invokes a native method. When [timeout] is given, a technical
+  /// request that TDLib never answers fails with [ProviderNetwork]
+  /// instead of hanging forever. The user-wait that follows a request
+  /// (for phone/code/QR input) is not a method call and has no timeout.
+  Future<Object?> _invoke(
+    String method,
+    Map<String, Object?> args, {
+    Duration? timeout,
+  }) async {
     try {
-      return await _channel.invokeMethod(method, args);
+      final future = _channel.invokeMethod(method, args);
+      if (timeout == null) return await future;
+      return await future.timeout(
+        timeout,
+        onTimeout: () {
+          throw ProviderNetwork('Timed out waiting for TDLib ($method).');
+        },
+      );
+    } on ProviderError {
+      rethrow;
     } on PlatformException catch (e) {
       throw _mapPlatformException(e);
     } on MissingPluginException {

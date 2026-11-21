@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:telemanager/providers/auth_state.dart';
+import 'package:telemanager/providers/capability_status.dart';
 import 'package:telemanager/providers/provider_error.dart';
 import 'package:telemanager/providers/storage_provider.dart';
 import 'package:telemanager/providers/telegram/telegram_provider.dart';
@@ -67,7 +68,7 @@ void runStorageProviderContractTests({
       final provider = await createAuthenticated();
       final caps = await provider.getAccountCapabilities();
       expect(caps.accountId.value, isNotEmpty);
-      expect(caps.supportsStreaming, isFalse);
+      expect(caps.supportsStreaming, CapabilityStatus.unknown);
       await provider.dispose();
     });
 
