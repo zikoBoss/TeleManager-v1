@@ -8,6 +8,11 @@ android {
     namespace = "com.example.telemanager"
     compileSdk = flutter.compileSdkVersion
 
+    // Task 05's TDLib test hooks are gated by BuildConfig.DEBUG.
+    buildFeatures {
+        buildConfig = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
