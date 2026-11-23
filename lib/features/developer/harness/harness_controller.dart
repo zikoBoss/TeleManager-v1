@@ -516,12 +516,10 @@ final class HarnessController extends ChangeNotifier {
             _bridge.isRequestUnresolved(TdlibBridge.logOutMethod),
           ),
         };
-        _pendingSetTdlibParameters = snapshots[
-          TdlibBridge.setTdlibParametersMethod
-        ]!.$1;
-        _unresolvedSetTdlibParameters = snapshots[
-          TdlibBridge.setTdlibParametersMethod
-        ]!.$2;
+        _pendingSetTdlibParameters =
+            snapshots[TdlibBridge.setTdlibParametersMethod]!.$1;
+        _unresolvedSetTdlibParameters =
+            snapshots[TdlibBridge.setTdlibParametersMethod]!.$2;
         _pendingLogOut = snapshots[TdlibBridge.logOutMethod]!.$1;
         _unresolvedLogOut = snapshots[TdlibBridge.logOutMethod]!.$2;
 
@@ -532,9 +530,8 @@ final class HarnessController extends ChangeNotifier {
               'pending=${pending ? 'yes' : 'no'};'
               'unresolved=${unresolved ? 'yes' : 'no'}';
           if (_lastRequestSnapshots[entry.key] == snapshot) continue;
-          final wasPending = _lastRequestSnapshots[entry.key]?.contains(
-                'pending=yes',
-              ) ??
+          final wasPending =
+              _lastRequestSnapshots[entry.key]?.contains('pending=yes') ??
               false;
           if (pending && !wasPending) {
             _requestStopwatches[entry.key] = Stopwatch()..start();

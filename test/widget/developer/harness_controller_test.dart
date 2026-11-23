@@ -270,8 +270,7 @@ void main() {
       'refreshDiagnostics updates credentials, key status, and counts',
       () async {
         final store = storedCredentials();
-        final keyStore = FakeTdlibDatabaseKeyStore()
-          ..storedKey = Uint8List(32);
+        final keyStore = FakeTdlibDatabaseKeyStore()..storedKey = Uint8List(32);
         final testHooks = FakeHarnessTestHooks()
           ..sendCounts = {'setTdlibParameters': 1};
         final controller = createController(

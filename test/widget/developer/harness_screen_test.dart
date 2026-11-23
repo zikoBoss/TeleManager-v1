@@ -72,10 +72,8 @@ void main() {
     // reports the account, then rebuild.
     await tester.runAsync(() async {
       final deadline = DateTime.now().add(const Duration(seconds: 5));
-      while (
-        (controller.myId == null || controller.busy) &&
-        DateTime.now().isBefore(deadline)
-      ) {
+      while ((controller.myId == null || controller.busy) &&
+          DateTime.now().isBefore(deadline)) {
         await Future.delayed(const Duration(milliseconds: 10));
       }
     });
