@@ -72,12 +72,19 @@ void main() {
     // reports the account, then rebuild.
     await tester.runAsync(() async {
       final deadline = DateTime.now().add(const Duration(seconds: 5));
-      while (controller.myId == null && DateTime.now().isBefore(deadline)) {
+      while (
+        (controller.myId == null || controller.busy) &&
+        DateTime.now().isBefore(deadline)
+      ) {
         await Future.delayed(const Duration(milliseconds: 10));
       }
     });
     await tester.pump();
     expect(find.textContaining('my_id: 8934661485'), findsOneWidget);
+    await tester.tap(find.text('Refresh'));
+    await pumpEventQueue();
+    await tester.pump();
+    expect(controller.lastActionResult, 'diagnostics refreshed');
   });
 
   testWidgets('the QR display appears on WaitOtherDeviceConfirmation', (

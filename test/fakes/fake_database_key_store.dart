@@ -24,6 +24,12 @@ final class FakeTdlibDatabaseKeyStore implements TdlibDatabaseKeyStore {
   /// How many times [createKey] was called (proves single generation).
   int createKeyCalls = 0;
 
+  /// How many times [clearKey] was called (for Reset safety tests).
+  int clearKeyCalls = 0;
+
+  /// Optional test barrier used to observe Reset while key clearing waits.
+  Future<void> Function()? beforeClearKey;
+
   /// The `databaseExists` flags passed to [getOrCreateKey], in order.
   final List<bool> getOrCreateDatabaseExistsArgs = [];
 
@@ -47,6 +53,8 @@ final class FakeTdlibDatabaseKeyStore implements TdlibDatabaseKeyStore {
 
   @override
   Future<void> clearKey() async {
+    clearKeyCalls++;
+    await beforeClearKey?.call();
     storedKey = null;
   }
 

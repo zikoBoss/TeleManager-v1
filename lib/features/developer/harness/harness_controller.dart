@@ -89,12 +89,22 @@ final class HarnessController extends ChangeNotifier {
   var _providerInitialized = false;
   var _credentialsSaved = false;
   String _keyStatus = 'unknown';
+  String _databaseStatus = 'unknown';
   Map<String, int> _sendCounts = {};
   var _pendingSetTdlibParameters = false;
   var _unresolvedSetTdlibParameters = false;
   var _pendingLogOut = false;
   var _unresolvedLogOut = false;
   String? _lastActionResult;
+  Timer? _pendingMonitor;
+  var _pendingMonitorSawRequest = false;
+  Completer<void>? _pendingRefreshCompleter;
+  var _pendingRefreshAgain = false;
+  final Map<String, Stopwatch> _requestStopwatches = {};
+  final Map<String, String> _lastRequestSnapshots = {
+    TdlibBridge.setTdlibParametersMethod: 'pending=no;unresolved=no',
+    TdlibBridge.logOutMethod: 'pending=no;unresolved=no',
+  };
 
   AuthState get authState => _authState;
   ProviderError? get lastError => _lastError;
@@ -119,6 +129,7 @@ final class HarnessController extends ChangeNotifier {
   /// Database key status: `present`, `missing`, `corrupt`,
   /// `unreadable`, or `unknown`. Never the key itself.
   String get keyStatus => _keyStatus;
+  String get databaseStatus => _databaseStatus;
 
   Map<String, int> get sendCounts => Map.unmodifiable(_sendCounts);
   bool get pendingSetTdlibParameters => _pendingSetTdlibParameters;
@@ -140,7 +151,9 @@ final class HarnessController extends ChangeNotifier {
       await _createAndInitializeProvider();
       await refreshCredentialsStatus();
       await refreshKeyStatus();
+      await refreshDatabaseStatus();
       await refreshPending();
+      await refreshSendCounts();
       _log('harness initialized');
     } finally {
       _setBusy(false);
@@ -173,6 +186,7 @@ final class HarnessController extends ChangeNotifier {
     try {
       await _createAndInitializeProvider();
       await refreshKeyStatus();
+      await refreshDatabaseStatus();
       await refreshPending();
       _setActionResult('new provider created and initialized');
       _log('new provider created');
@@ -187,12 +201,24 @@ final class HarnessController extends ChangeNotifier {
   /// Disposes the current provider (the TDLib client is closed and
   /// confirmed). A new provider must be created explicitly afterwards.
   Future<void> disposeProvider() async {
-    final provider = _provider;
-    if (provider == null) {
-      _setActionResult('no provider to dispose');
+    if (_busy) {
+      _setActionResult('dispose refused: another Harness action is running');
       return;
     }
     _setBusy(true);
+    try {
+      await _disposeCurrentProvider();
+    } finally {
+      _setBusy(false);
+    }
+  }
+
+  Future<bool> _disposeCurrentProvider() async {
+    final provider = _provider;
+    if (provider == null) {
+      _setActionResult('no provider to dispose');
+      return true;
+    }
     try {
       await _authSub?.cancel();
       _authSub = null;
@@ -205,11 +231,11 @@ final class HarnessController extends ChangeNotifier {
       await refreshPending();
       _setActionResult('provider disposed');
       _log('provider disposed');
+      return true;
     } catch (e) {
       _setActionResult('dispose failed: ${_errorLabel(e)}');
       _log('dispose failed: ${_errorLabel(e)}');
-    } finally {
-      _setBusy(false);
+      return false;
     }
   }
 
@@ -224,6 +250,7 @@ final class HarnessController extends ChangeNotifier {
       return;
     }
     _setBusy(true);
+    _startPendingMonitor();
     try {
       final result = await provider.authenticate();
       _setActionResult('authenticate -> ${_stateName(result)}');
@@ -235,6 +262,7 @@ final class HarnessController extends ChangeNotifier {
       _log('authenticate threw: ${_errorLabel(e)}');
     } finally {
       _setBusy(false);
+      if (!_pendingMonitorSawRequest) _stopPendingMonitor();
     }
   }
 
@@ -248,6 +276,7 @@ final class HarnessController extends ChangeNotifier {
       return;
     }
     _setBusy(true);
+    _startPendingMonitor();
     try {
       await provider.signOut();
       _setActionResult('signOut completed');
@@ -262,6 +291,7 @@ final class HarnessController extends ChangeNotifier {
       _log('signOut threw: ${_errorLabel(e)}');
     } finally {
       _setBusy(false);
+      if (!_pendingMonitorSawRequest) _stopPendingMonitor();
     }
   }
 
@@ -277,25 +307,57 @@ final class HarnessController extends ChangeNotifier {
   /// On any verification failure it reports the failure and does NOT
   /// create a provider.
   Future<void> resetTestSession() async {
-    if (_busy) return;
+    if (_busy) {
+      _setActionResult('reset refused: another Harness action is running');
+      _log('reset refused: another action is running');
+      return;
+    }
     _setBusy(true);
     try {
       await refreshPending();
+      await refreshDatabaseStatus();
+      await refreshKeyStatus();
+      final databaseBefore = _databaseStatus;
+      final keyBefore = _keyStatus;
+      // Read the bridge again synchronously at the destructive-action
+      // boundary; a concurrent diagnostic refresh must not leave Reset
+      // relying on a stale cached snapshot.
+      _pendingSetTdlibParameters = _bridge.hasPendingRequest(
+        TdlibBridge.setTdlibParametersMethod,
+      );
+      _unresolvedSetTdlibParameters = _bridge.isRequestUnresolved(
+        TdlibBridge.setTdlibParametersMethod,
+      );
+      _pendingLogOut = _bridge.hasPendingRequest(TdlibBridge.logOutMethod);
+      _unresolvedLogOut = _bridge.isRequestUnresolved(TdlibBridge.logOutMethod);
       if (_pendingSetTdlibParameters ||
           _unresolvedSetTdlibParameters ||
           _pendingLogOut ||
           _unresolvedLogOut) {
+        await refreshDatabaseStatus();
+        await refreshKeyStatus();
+        final storageUnchanged =
+            databaseBefore == _databaseStatus && keyBefore == _keyStatus;
         _setActionResult(
           'reset refused: a request is still pending or unresolved; '
-          'wait for the late reply first',
+          'wait for the late reply first; database=$databaseBefore, '
+          'key=$keyBefore, storage unchanged=${storageUnchanged ? 'yes' : 'no'}',
         );
-        _log('reset refused: pending request');
+        _log(
+          'reset refused: pending request; database=$databaseBefore, '
+          'key=$keyBefore, storage unchanged=${storageUnchanged ? 'yes' : 'no'}',
+        );
         return;
       }
       // Dispose first: the TDLib client must be closed before its
       // database directory is deleted.
       if (_provider != null) {
-        await disposeProvider();
+        final disposed = await _disposeCurrentProvider();
+        if (!disposed || _provider != null) {
+          _setActionResult('reset stopped: provider disposal did not complete');
+          _log('reset stopped: provider disposal failed');
+          return;
+        }
       }
       // Delete the database directory and clear its key, together.
       var dirDeleted = false;
@@ -323,12 +385,13 @@ final class HarnessController extends ChangeNotifier {
       } catch (_) {
         keyGone = false;
       }
+      await refreshKeyStatus();
+      await refreshDatabaseStatus();
       if (dirDeleted && keyCleared && dirGone && keyGone) {
         _setActionResult(
           'test session reset verified (database deleted, key cleared)',
         );
         _log('test session reset verified');
-        await refreshKeyStatus();
       } else {
         _setActionResult(
           'reset verification FAILED '
@@ -413,26 +476,149 @@ final class HarnessController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Refreshes the pending/unresolved indicators from the bridge.
-  Future<void> refreshPending() async {
-    _pendingSetTdlibParameters = _bridge.hasPendingRequest(
-      TdlibBridge.setTdlibParametersMethod,
-    );
-    _unresolvedSetTdlibParameters = _bridge.isRequestUnresolved(
-      TdlibBridge.setTdlibParametersMethod,
-    );
-    _pendingLogOut = _bridge.hasPendingRequest(TdlibBridge.logOutMethod);
-    _unresolvedLogOut = _bridge.isRequestUnresolved(TdlibBridge.logOutMethod);
+  /// Refreshes whether the test database directory exists, without
+  /// reading its contents or exposing its path.
+  Future<void> refreshDatabaseStatus() async {
+    try {
+      _databaseStatus = await Directory(_databaseDirectory).exists()
+          ? 'present'
+          : 'missing';
+    } catch (_) {
+      _databaseStatus = 'unknown';
+    }
     notifyListeners();
   }
 
-  /// Refreshes the send counts (debug builds only).
-  Future<void> refreshSendCounts() async {
+  /// Refreshes the pending/unresolved indicators from the bridge.
+  Future<void> refreshPending() {
+    final inFlight = _pendingRefreshCompleter;
+    if (inFlight != null) {
+      _pendingRefreshAgain = true;
+      return inFlight.future;
+    }
+    final completer = Completer<void>();
+    _pendingRefreshCompleter = completer;
+    unawaited(_refreshPendingLoop(completer));
+    return completer.future;
+  }
+
+  Future<void> _refreshPendingLoop(Completer<void> completer) async {
+    try {
+      do {
+        _pendingRefreshAgain = false;
+        final snapshots = <String, (bool, bool)>{
+          TdlibBridge.setTdlibParametersMethod: (
+            _bridge.hasPendingRequest(TdlibBridge.setTdlibParametersMethod),
+            _bridge.isRequestUnresolved(TdlibBridge.setTdlibParametersMethod),
+          ),
+          TdlibBridge.logOutMethod: (
+            _bridge.hasPendingRequest(TdlibBridge.logOutMethod),
+            _bridge.isRequestUnresolved(TdlibBridge.logOutMethod),
+          ),
+        };
+        _pendingSetTdlibParameters = snapshots[
+          TdlibBridge.setTdlibParametersMethod
+        ]!.$1;
+        _unresolvedSetTdlibParameters = snapshots[
+          TdlibBridge.setTdlibParametersMethod
+        ]!.$2;
+        _pendingLogOut = snapshots[TdlibBridge.logOutMethod]!.$1;
+        _unresolvedLogOut = snapshots[TdlibBridge.logOutMethod]!.$2;
+
+        final changed = <String>[];
+        for (final entry in snapshots.entries) {
+          final (pending, unresolved) = entry.value;
+          final snapshot =
+              'pending=${pending ? 'yes' : 'no'};'
+              'unresolved=${unresolved ? 'yes' : 'no'}';
+          if (_lastRequestSnapshots[entry.key] == snapshot) continue;
+          final wasPending = _lastRequestSnapshots[entry.key]?.contains(
+                'pending=yes',
+              ) ??
+              false;
+          if (pending && !wasPending) {
+            _requestStopwatches[entry.key] = Stopwatch()..start();
+          }
+          _lastRequestSnapshots[entry.key] = snapshot;
+          changed.add(entry.key);
+        }
+        if (changed.isNotEmpty) await _refreshSendCountsSnapshot();
+        for (final method in changed) {
+          final (pending, unresolved) = snapshots[method]!;
+          final elapsed = _requestStopwatches[method]?.elapsedMilliseconds ?? 0;
+          final count = _sendCounts[method] ?? 0;
+          _log(
+            'request $method observed: pending=${pending ? 'yes' : 'no'}, '
+            'unresolved=${unresolved ? 'yes' : 'no'}, '
+            'sends=$count, since-first-observed=${elapsed}ms',
+          );
+          if (!pending && !unresolved) {
+            _requestStopwatches.remove(method)?.stop();
+          }
+        }
+        notifyListeners();
+      } while (_pendingRefreshAgain);
+      completer.complete();
+    } catch (error, stackTrace) {
+      completer.completeError(error, stackTrace);
+    } finally {
+      _pendingRefreshCompleter = null;
+    }
+  }
+
+  /// Refreshes all status shown in the Harness, not only request flags.
+  Future<void> refreshDiagnostics() async {
+    await Future.wait([
+      refreshCredentialsStatus(),
+      refreshKeyStatus(),
+      refreshDatabaseStatus(),
+      refreshPending(),
+      refreshSendCounts(),
+    ]);
+    _setActionResult('diagnostics refreshed');
+    _log('diagnostics refreshed');
+  }
+
+  void _startPendingMonitor() {
+    if (_pendingMonitor != null) return;
+    _pendingMonitorSawRequest = false;
+    _pendingMonitor = Timer.periodic(
+      const Duration(milliseconds: 200),
+      (_) => unawaited(_pollPendingMonitor()),
+    );
+  }
+
+  Future<void> _pollPendingMonitor() async {
+    await refreshPending();
+    final pending =
+        _pendingSetTdlibParameters ||
+        _unresolvedSetTdlibParameters ||
+        _pendingLogOut ||
+        _unresolvedLogOut;
+    if (pending) {
+      _pendingMonitorSawRequest = true;
+    } else if (_pendingMonitorSawRequest) {
+      _stopPendingMonitor();
+    }
+  }
+
+  void _stopPendingMonitor() {
+    _pendingMonitor?.cancel();
+    _pendingMonitor = null;
+    _pendingMonitorSawRequest = false;
+  }
+
+  Future<void> _refreshSendCountsSnapshot() async {
     try {
       _sendCounts = await _testHooks.getTestSendCounts();
     } catch (_) {
       _sendCounts = {};
     }
+  }
+
+  /// Refreshes the send counts (debug builds only).
+  Future<void> refreshSendCounts() async {
+    await _refreshSendCountsSnapshot();
     notifyListeners();
   }
 
@@ -498,6 +684,7 @@ final class HarnessController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _stopPendingMonitor();
     unawaited(_authSub?.cancel());
     unawaited(_provider?.dispose());
     super.dispose();

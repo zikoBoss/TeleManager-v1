@@ -49,7 +49,10 @@ final class HarnessScreen extends StatelessWidget {
                     'Provider: ${c.providerInitialized ? 'initialized' : 'not initialized'}',
                   ),
                   Text('Database key: ${c.keyStatus}'),
-                  Text('Database: ${c.databaseDirectoryLabel}'),
+                  Text(
+                    'Database: ${c.databaseDirectoryLabel} '
+                    '(${c.databaseStatus})',
+                  ),
                   Text(
                     'Credentials: ${c.credentialsSaved ? 'saved' : 'not saved'}',
                   ),
@@ -102,7 +105,7 @@ final class HarnessScreen extends StatelessWidget {
                         child: const Text('Reset Test Session'),
                       ),
                       ElevatedButton(
-                        onPressed: c.busy ? null : c.refreshPending,
+                        onPressed: c.busy ? null : c.refreshDiagnostics,
                         child: const Text('Refresh'),
                       ),
                     ],
