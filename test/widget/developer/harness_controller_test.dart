@@ -37,6 +37,18 @@ FakeTelegramCredentialsStore storedCredentials() {
     ..apiHash = 'hash';
 }
 
+Future<void> pumpUntil(
+  WidgetTester tester,
+  bool Function() condition, {
+  int maxPumps = 50,
+  Duration step = const Duration(milliseconds: 1),
+}) async {
+  for (var i = 0; i < maxPumps && !condition(); i++) {
+    await tester.pump(step);
+  }
+  await tester.pump();
+}
+
 void main() {
   test('Harness event log includes millisecond timestamps', () {
     final log = HarnessEventLog()..add('safe event');
@@ -316,8 +328,13 @@ void main() {
         );
       };
       final authenticate = controller.authenticate();
-      await pumpEventQueue();
-      await tester.pump(const Duration(milliseconds: 250));
+      await pumpUntil(
+        tester,
+        () => bridge.hasPendingRequest(
+          TdlibBridge.setTdlibParametersMethod,
+        ),
+        step: const Duration(milliseconds: 250),
+      );
       expect(
         controller.eventLog.toText(),
         contains(
@@ -327,7 +344,13 @@ void main() {
       expect(controller.eventLog.toText(), contains('sends=1'));
 
       bridge.timeoutHungCall(TdlibBridge.setTdlibParametersMethod);
-      await tester.pump(const Duration(milliseconds: 250));
+      await pumpUntil(
+        tester,
+        () => controller.eventLog.toText().contains(
+          'request setTdlibParameters observed: pending=yes, unresolved=yes',
+        ),
+        step: const Duration(milliseconds: 250),
+      );
       expect(
         controller.eventLog.toText(),
         contains(
@@ -336,7 +359,13 @@ void main() {
       );
 
       bridge.resolveHungCall(TdlibBridge.setTdlibParametersMethod);
-      await tester.pump(const Duration(milliseconds: 250));
+      await pumpUntil(
+        tester,
+        () => controller.eventLog.toText().contains(
+          'request setTdlibParameters observed: pending=no, unresolved=no',
+        ),
+        step: const Duration(milliseconds: 250),
+      );
       expect(
         controller.eventLog.toText(),
         contains(
@@ -348,6 +377,10 @@ void main() {
         matches(r'since-first-observed=\d+ms'),
       );
       bridge.emitReady();
+      await pumpUntil(
+        tester,
+        () => controller.authState is AuthAuthenticated,
+      );
       await authenticate;
       await controller.disposeProvider();
       controller.dispose();

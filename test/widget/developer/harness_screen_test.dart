@@ -22,9 +22,10 @@ Future<void> pumpUntil(
   WidgetTester tester,
   bool Function() condition, {
   int maxPumps = 50,
+  Duration step = const Duration(milliseconds: 1),
 }) async {
   for (var i = 0; i < maxPumps && !condition(); i++) {
-    await tester.pump();
+    await tester.pump(step);
   }
   await tester.pump();
 }
@@ -64,24 +65,16 @@ void main() {
     // Authenticate and verify the screen shows my_id.
     bridge.onSetTdlibParameters = bridge.emitReady;
     await tester.tap(find.text('Authenticate'));
-    // The tap starts authenticate() fire-and-forget. The flow is
-    // driven by a broadcast stream + unawaited async work (Ready ->
-    // getMyId), which FakeAsync's pump() does not flush (verified:
-    // 50 pumps leave the flow stuck at AuthAuthenticating, while real
-    // async completes it). Let real async run until the controller
-    // reports the account, then rebuild.
-    await tester.runAsync(() async {
-      final deadline = DateTime.now().add(const Duration(seconds: 5));
-      while ((controller.myId == null || controller.busy) &&
-          DateTime.now().isBefore(deadline)) {
-        await Future.delayed(const Duration(milliseconds: 10));
-      }
-    });
-    await tester.pump();
+    await pumpUntil(
+      tester,
+      () => controller.myId != null && !controller.busy,
+    );
     expect(find.textContaining('my_id: 8934661485'), findsOneWidget);
     await tester.tap(find.text('Refresh'));
-    await pumpEventQueue();
-    await tester.pump();
+    await pumpUntil(
+      tester,
+      () => controller.lastActionResult == 'diagnostics refreshed',
+    );
     expect(controller.lastActionResult, 'diagnostics refreshed');
   });
 
