@@ -330,9 +330,7 @@ void main() {
       final authenticate = controller.authenticate();
       await pumpUntil(
         tester,
-        () => bridge.hasPendingRequest(
-          TdlibBridge.setTdlibParametersMethod,
-        ),
+        () => bridge.hasPendingRequest(TdlibBridge.setTdlibParametersMethod),
         step: const Duration(milliseconds: 250),
       );
       expect(
@@ -377,10 +375,7 @@ void main() {
         matches(r'since-first-observed=\d+ms'),
       );
       bridge.emitReady();
-      await pumpUntil(
-        tester,
-        () => controller.authState is AuthAuthenticated,
-      );
+      await pumpUntil(tester, () => controller.authState is AuthAuthenticated);
       await authenticate;
       await controller.disposeProvider();
       controller.dispose();

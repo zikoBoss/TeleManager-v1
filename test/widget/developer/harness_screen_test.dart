@@ -65,10 +65,7 @@ void main() {
     // Authenticate and verify the screen shows my_id.
     bridge.onSetTdlibParameters = bridge.emitReady;
     await tester.tap(find.text('Authenticate'));
-    await pumpUntil(
-      tester,
-      () => controller.myId != null && !controller.busy,
-    );
+    await pumpUntil(tester, () => controller.myId != null && !controller.busy);
     expect(find.textContaining('my_id: 8934661485'), findsOneWidget);
     await tester.tap(find.text('Refresh'));
     await pumpUntil(
